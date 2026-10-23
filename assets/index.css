@@ -13,6 +13,7 @@
   --svg-tertiary: #24292e;
   --border-primary: #ddd;
   --border-secondary: #ced4da;
+  --text-error: #b31d28;
 }
 
 html {
@@ -339,6 +340,8 @@ textarea:focus-visible,
 }
 
 .toolbox-right {
+  display: flex;
+  align-items: center;
   margin-left: auto;
   margin-right: 2em;
 }
@@ -364,6 +367,54 @@ button.toolbox-right,
 .save-btn {
   -webkit-user-select: none;
   user-select: none;
+}
+
+.save-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.save-status {
+  color: var(--text-secondary);
+  font-size: 0.9em;
+  padding-right: 0.5em;
+}
+
+.editor-error {
+  margin-bottom: 0.5em;
+  padding: 0.5em 0.75em;
+  border: 1px solid var(--text-error);
+  border-radius: 4px;
+  color: var(--text-error);
+}
+
+.editor-error-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.editor-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin-top: 0.5em;
+}
+
+.editor-error-actions button {
+  min-height: 44px;
+  padding: 0 1em;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.editor-error-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .logout-btn {
@@ -426,6 +477,11 @@ button.toolbox-right,
 
   .toolbox-right {
     margin: 0 0 0 auto;
+  }
+
+  .save-btn {
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .searchbar {
@@ -673,5 +729,6 @@ button.toolbox-right,
     --svg-tertiary: #ffffff99;
     --border-primary: #ffffff40;
     --border-secondary: #ced4da; /*Unchanged in both color schemes*/
+    --text-error: #ff7b72;
   }
 }

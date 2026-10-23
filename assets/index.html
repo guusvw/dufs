@@ -94,6 +94,7 @@
         </svg>
         <span class="user-name"></span>
       </button>
+      <span class="save-status" role="status" aria-live="polite"></span>
       <button type="button" class="save-btn hidden" title="Save file" aria-label="Save file">
         <svg viewBox="0 0 1024 1024" width="24" height="24">
           <path
@@ -127,6 +128,13 @@
     </div>
     <div class="editor-page hidden">
       <div class="not-editable hidden"></div>
+      <div class="editor-error hidden">
+        <p class="editor-error-text" role="alert"></p>
+        <div class="editor-error-actions hidden">
+          <button type="button" class="editor-reload-btn">Reload (discard mine)</button>
+          <button type="button" class="editor-overwrite-btn">Overwrite</button>
+        </div>
+      </div>
       <textarea id="editor" class="editor hidden" aria-label="Editor" cols="10"></textarea>
     </div>
   </div>
