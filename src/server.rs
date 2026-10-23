@@ -273,7 +273,7 @@ impl Server {
                 .iter()
                 .any(|v| v.as_str() == req_path)
             {
-                self.handle_send_file(&self.args.serve_path, headers, head_only, &mut res)
+                self.handle_send_file(&self.args.serve_path, headers, head_only, true, &mut res)
                     .await?;
             } else {
                 self.handle_not_found(&query_params, head_only, &mut res)
@@ -436,7 +436,7 @@ impl Server {
                             DufsErrorCode::HashDisabled.respond(&mut res);
                         }
                     } else {
-                        self.handle_send_file(path, headers, head_only, &mut res)
+                        self.handle_send_file(path, headers, head_only, true, &mut res)
                             .await?;
                     }
                 } else if render_spa {
@@ -988,7 +988,7 @@ impl Server {
                 .map(|v| v.is_file())
                 .unwrap_or_default()
         {
-            self.handle_send_file(&index_path, headers, head_only, res)
+            self.handle_send_file(&index_path, headers, head_only, false, res)
                 .await?;
         } else if self.args.render_try_index {
             self.handle_ls_dir(
@@ -1051,7 +1051,7 @@ impl Server {
     ) -> Result<()> {
         let index_path = self.args.serve_path.join(INDEX_NAME);
         if path.extension().is_none() && !self.guard_root_contained(&index_path).await {
-            self.handle_send_file(&index_path, headers, head_only, res)
+            self.handle_send_file(&index_path, headers, head_only, false, res)
                 .await?;
         } else {
             self.handle_not_found(query_params, head_only, res).await?;
@@ -1129,7 +1129,7 @@ impl Server {
                         }
                     };
                     if fs::metadata(&path).await.is_ok() {
-                        self.handle_send_file(&path, headers, head_only, res)
+                        self.handle_send_file(&path, headers, head_only, true, res)
                             .await?;
                     } else {
                         status_not_found(res);
@@ -1209,6 +1209,7 @@ impl Server {
         path: &Path,
         headers: &HeaderMap<HeaderValue>,
         head_only: bool,
+        sandbox: bool,
         res: &mut Response,
     ) -> Result<()> {
         let (file, meta) = tokio::join!(fs::File::open(path), fs::metadata(path),);
@@ -1265,9 +1266,12 @@ impl Server {
         let filename = try_get_file_name(path)?;
         set_content_disposition(res, true, filename)?;
         // User files share the UI origin: sandbox them so served HTML/SVG
-        // cannot script the dufs origin, and forbid MIME sniffing.
-        res.headers_mut()
-            .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+        // cannot script the dufs origin, and forbid MIME sniffing. The
+        // --render-* handlers opt out: the operator chose to host a site.
+        if sandbox {
+            res.headers_mut()
+                .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+        }
         res.headers_mut().insert(
             "x-content-type-options",
             HeaderValue::from_static("nosniff"),

@@ -78,3 +78,39 @@ fn render_spa2(#[with(&["--render-spa"])] server: TestServer) -> Result<(), Erro
     assert_eq!(text, "This is index.html");
     Ok(())
 }
+
+#[rstest]
+#[case(server(&["--render-index"] as &[&str]))]
+#[case(server(&["--render-try-index"] as &[&str]))]
+#[case(server(&["--render-spa"] as &[&str]))]
+fn render_index_is_not_sandboxed(#[case] server: TestServer) -> Result<(), Error> {
+    // A hosted site must be able to run its scripts, so the sandbox CSP is
+    // omitted on the index.html served by the render handlers...
+    let resp = reqwest::blocking::get(server.url())?;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-security-policy").is_none());
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(resp.text()?, "This is index.html");
+    // ...but a file requested directly keeps it.
+    let resp = reqwest::blocking::get(format!("{}test.html", server.url()))?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-security-policy").unwrap(),
+        "sandbox"
+    );
+    Ok(())
+}
+
+#[rstest]
+fn render_spa_fallback_is_not_sandboxed(
+    #[with(&["--render-spa"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = reqwest::blocking::get(format!("{}app/route", server.url()))?;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-security-policy").is_none());
+    assert_eq!(resp.text()?, "This is index.html");
+    Ok(())
+}
