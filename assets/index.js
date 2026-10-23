@@ -68,6 +68,29 @@ const ICONS = {
 const failUploaders = new Map();
 
 /**
+ * Names of the selected entries, as listed in DATA.paths.
+ * @type Set<string>
+ */
+const selection = new Set();
+/**
+ * The row a shift-click range starts from: the last one clicked.
+ * @type string | null
+ */
+let selectAnchor = null;
+/**
+ * Whether a bulk action is running.
+ */
+let bulkBusy = false;
+
+// The browser needs a breather between two programmatic downloads, or it
+// drops all but the first.
+const DOWNLOAD_GAP_MS = 300;
+// More downloads than this are confirmed first.
+const DOWNLOAD_CONFIRM_ABOVE = 10;
+// A delete confirmation lists this many names, then "and N more".
+const CONFIRM_LIST_MAX = 10;
+
+/**
  * @type Element
  */
 let $pathsTable;
@@ -501,6 +524,7 @@ async function setupIndexPage() {
     setupDownloadWithToken();
   }
 
+  setupSelection();
   renderPathsTableHead();
   renderPathsTableBody();
 }
@@ -528,6 +552,7 @@ function renderPathsTableHead() {
   ];
   $pathsTableHead.insertAdjacentHTML("beforeend", `
     <tr>
+      <th class="cell-select"><label class="select-box"><input type="checkbox" class="select-all" aria-label="Select all"><span class="select-all-text">Select all</span></label></th>
       <th class="cell-icon"></th>
       ${headerItems.map(item => {
     // The server sorts by name ascending when no sort is asked for, so the
@@ -578,7 +603,7 @@ function captureFocus() {
  * @returns {Element[]}
  */
 function rowControls(row) {
-  return Array.from(row.querySelectorAll("a[href], button"));
+  return Array.from(row.querySelectorAll("a[href], button, input"));
 }
 
 /**
@@ -606,6 +631,10 @@ function restoreFocus(focus) {
  * goes afterwards; defaults to where it is now
  */
 function renderPathsTableBody(focus = captureFocus()) {
+  const listed = new Set(DATA.paths.map(p => p.name));
+  for (const name of selection) {
+    if (!listed.has(name)) selection.delete(name);
+  }
   const scrollY = window.scrollY;
   $pathsTableBody.replaceChildren();
   if (DATA.paths.length > 0) {
@@ -627,6 +656,7 @@ function renderPathsTableBody(focus = captureFocus()) {
     $emptyFolder.classList.remove("hidden");
   }
   window.scrollTo(window.scrollX, scrollY);
+  syncSelection();
   restoreFocus(focus);
 }
 
@@ -778,6 +808,7 @@ function addPath(file, showMove, showDelete) {
 
   $pathsTableBody.insertAdjacentHTML("beforeend", `
 <tr data-name="${escapedName}">
+  <td class="cell-select"><label class="select-box"><input type="checkbox" data-select aria-label="Select ${escapedName}"></label></td>
   <td class="path cell-icon">
     ${getPathSvg(file.path_type)}
   </td>
@@ -842,24 +873,37 @@ function setupDownloadWithToken() {
     if (!link) return;
     e.preventDefault();
     try {
-      const originalHref = link.getAttribute("href");
-      const tokengenUrl = new URL(originalHref);
-      tokengenUrl.searchParams.set("tokengen", "");
-      const res = await fetch(tokengenUrl);
-      if (!res.ok) throw new Error("Failed to fetch token");
-      const token = await res.text();
-      const downloadUrl = new URL(originalHref);
-      downloadUrl.searchParams.set("token", token);
-      const tempA = document.createElement("a");
-      tempA.href = downloadUrl.toString();
-      tempA.download = "";
-      document.body.appendChild(tempA);
-      tempA.click();
-      document.body.removeChild(tempA);
+      await startDownload(link.getAttribute("href"));
     } catch (err) {
       showNotice(`Failed to download, ${err.message}`);
     }
   });
+}
+
+/**
+ * Start the browser's download of a URL: through a fresh one-time token when
+ * a user is logged in, directly otherwise.
+ * @param {string} href
+ * @param {string} [filename]  suggested name; the server's wins when it sends one
+ */
+async function startDownload(href, filename = "") {
+  let url = href;
+  if (DATA.user) {
+    const tokengenUrl = new URL(href);
+    tokengenUrl.searchParams.set("tokengen", "");
+    const res = await fetch(tokengenUrl);
+    if (!res.ok) throw new Error("Failed to fetch token");
+    const token = await res.text();
+    const downloadUrl = new URL(href);
+    downloadUrl.searchParams.set("token", token);
+    url = downloadUrl.toString();
+  }
+  const tempA = document.createElement("a");
+  tempA.href = url;
+  tempA.download = filename;
+  document.body.appendChild(tempA);
+  tempA.click();
+  document.body.removeChild(tempA);
 }
 
 function setupSearch() {
@@ -1009,6 +1053,11 @@ async function setupEditorPage() {
  * @param {MouseEvent} e
  */
 function onPathsTableClick(e) {
+  const box = e.target.closest("input[data-select]");
+  if (box) {
+    toggleSelected(box, e.shiftKey);
+    return;
+  }
   const button = e.target.closest("button[data-action]");
   if (!button) return;
   const name = button.closest("tr").dataset.name;
@@ -1067,10 +1116,9 @@ async function doDeletePath(name, url, cb, entry) {
     await assertResOK(res);
     cb();
   } catch (err) {
-    if (err.code === "readonly-descendant") {
-      showNotice(`Cannot delete \`${name}\`: the directory contains read-only entries`);
-    } else if (err.code === "delete-disabled") {
-      showNotice(`Cannot delete \`${name}\`: delete is disabled`);
+    const blocked = deleteBlockedReason(err);
+    if (blocked) {
+      showNotice(`Cannot delete \`${name}\`: ${blocked}`);
     } else {
       showNotice(`Cannot delete \`${name}\`, ${err.message}`);
     }
@@ -1142,13 +1190,387 @@ async function doMovePath(fileUrl, isDir = false) {
     await assertResOK(res);
     return newFileUrl;
   } catch (err) {
-    if (err.code === "readonly-descendant") {
-      showNotice(`Cannot move \`${filePath}\`: the directory contains read-only entries`);
-    } else if (err.code === "upload-disabled" || err.code === "delete-disabled") {
-      showNotice(`Cannot move \`${filePath}\`: moving is disabled`);
+    const blocked = moveBlockedReason(err);
+    if (blocked) {
+      showNotice(`Cannot move \`${filePath}\`: ${blocked}`);
     } else {
       showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
     }
+  }
+}
+
+/**
+ * Why the server refused a delete, when it said.
+ * @param {Error & {code?: string | null}} err
+ * @returns {string | null}
+ */
+function deleteBlockedReason(err) {
+  if (err.code === "readonly-descendant") return "the directory contains read-only entries";
+  if (err.code === "delete-disabled") return "delete is disabled";
+  return null;
+}
+
+/**
+ * Why the server refused a move, when it said.
+ * @param {Error & {code?: string | null}} err
+ * @returns {string | null}
+ */
+function moveBlockedReason(err) {
+  if (err.code === "readonly-descendant") return "the directory contains read-only entries";
+  if (err.code === "upload-disabled" || err.code === "delete-disabled") return "moving is disabled";
+  return null;
+}
+
+/**
+ * @param {PathItem} file
+ */
+function entryIsDir(file) {
+  return file.path_type.endsWith("Dir");
+}
+
+/**
+ * The last segment of a listed name; searches list entries by relative path.
+ * @param {PathItem} file
+ */
+function entryLeaf(file) {
+  return file.name.split("/").pop();
+}
+
+function setupSelection() {
+  $pathsTableHead.addEventListener("change", e => {
+    if (!e.target.matches(".select-all")) return;
+    selection.clear();
+    if (e.target.checked) {
+      for (const file of DATA.paths) selection.add(file.name);
+    }
+    selectAnchor = null;
+    syncSelection();
+  });
+  document.querySelector(".selection-bar").addEventListener("click", onBulkClick);
+  document.addEventListener("keydown", e => {
+    // A dialog takes the Escape for itself.
+    if (e.key !== "Escape" || selection.size === 0 || document.querySelector("dialog[open]")) return;
+    clearSelection();
+  });
+  // The selection belongs to this folder; it must not come back with the page
+  // from the back/forward cache.
+  window.addEventListener("pagehide", clearSelection);
+}
+
+/**
+ * Select or deselect the row of a clicked checkbox, and the whole range from
+ * the last clicked row with Shift.
+ * @param {HTMLInputElement} box  already toggled by the click
+ * @param {boolean} shift
+ */
+function toggleSelected(box, shift) {
+  const names = Array.from($pathsTableBody.rows, tr => tr.dataset.name);
+  const name = box.closest("tr").dataset.name;
+  let range = [name];
+  if (shift && selectAnchor !== null && names.includes(selectAnchor)) {
+    const from = names.indexOf(selectAnchor);
+    const to = names.indexOf(name);
+    range = names.slice(Math.min(from, to), Math.max(from, to) + 1);
+  }
+  for (const n of range) {
+    if (box.checked) selection.add(n);
+    else selection.delete(n);
+  }
+  selectAnchor = name;
+  syncSelection();
+}
+
+function clearSelection() {
+  selection.clear();
+  selectAnchor = null;
+  syncSelection();
+}
+
+/**
+ * Bring the checkboxes, the row highlight and the action bar in line with
+ * `selection`.
+ */
+function syncSelection() {
+  // The refusal it explained is about a selection that no longer exists.
+  clearNotice("bulk-refused");
+  const rows = Array.from($pathsTableBody.rows);
+  for (const tr of rows) {
+    const on = selection.has(tr.dataset.name);
+    tr.classList.toggle("selected", on);
+    tr.querySelector("input[data-select]").checked = on;
+  }
+  const $all = $pathsTableHead.querySelector(".select-all");
+  $all.checked = rows.length > 0 && selection.size === rows.length;
+  $all.indeterminate = selection.size > 0 && selection.size < rows.length;
+  renderSelectionBar();
+}
+
+/**
+ * @returns {PathItem[]}
+ */
+function selectedEntries() {
+  return DATA.paths.filter(p => selection.has(p.name));
+}
+
+/**
+ * Explain why `action` is refused when some selected entry does not allow it.
+ * @param {PathItem[]} entries
+ * @param {(file: PathItem) => boolean} allowed
+ * @param {"move" | "delete"} action
+ * @returns {string | null}
+ */
+function refusedReason(entries, allowed, action) {
+  const refused = entries.filter(file => !allowed(file));
+  if (refused.length === 0) return null;
+  const more = refused.length > 1 ? ` and ${refused.length - 1} more` : "";
+  return `Cannot ${action} \u201c${refused[0].name}\u201d${more}: ${deniedReason(refused[0], action)}`;
+}
+
+/**
+ * Show the action bar when something is selected, with the actions every
+ * selected entry allows. A refused action stays focusable, with the reason as
+ * its tooltip.
+ */
+function renderSelectionBar() {
+  const entries = selectedEntries();
+  const $bar = document.querySelector(".selection-bar");
+  $bar.classList.toggle("hidden", entries.length === 0);
+  if (entries.length === 0) return;
+  $bar.querySelector(".selection-count").textContent = `${entries.length} selected`;
+
+  /**
+   * @param {string} action
+   * @param {string | null} reason  why the action is refused, if it is
+   * @param {string} title  the tooltip of an allowed action
+   */
+  const setButton = (action, reason, title) => {
+    const $button = $bar.querySelector(`[data-bulk="${action}"]`);
+    $button.title = reason || title;
+    if (reason) $button.setAttribute("aria-disabled", "true");
+    else $button.removeAttribute("aria-disabled");
+  };
+
+  const dirs = entries.filter(entryIsDir).length;
+  const files = entries.length - dirs;
+  let downloadReason = null;
+  let downloadTitle = `Download ${entries.length} selected ${entries.length === 1 ? "entry" : "entries"}, one by one`;
+  if (dirs > 0 && !DATA.allow_archive) {
+    if (files === 0) {
+      downloadReason = "Cannot download folders: .zip download is disabled";
+    } else {
+      downloadTitle = `Download the ${files} selected ${files === 1 ? "file" : "files"} one by one; folders are skipped because .zip download is disabled`;
+    }
+  }
+  setButton("download", downloadReason, downloadTitle);
+  setButton("move", refusedReason(entries, p => p.allow_upload && p.allow_delete, "move"), "Move the selected entries to another folder");
+  setButton("delete", refusedReason(entries, p => p.allow_delete, "delete"), "Delete the selected entries");
+}
+
+/**
+ * Run the action of an action bar button.
+ * @param {MouseEvent} e
+ */
+async function onBulkClick(e) {
+  const $button = e.target.closest("button[data-bulk]");
+  if (!$button) return;
+  const action = $button.dataset.bulk;
+  if (action === "clear") {
+    clearSelection();
+    // The bar is gone with the selection; do not drop the focus on the page.
+    $pathsTableHead.querySelector(".select-all").focus();
+    return;
+  }
+  if (bulkBusy) return;
+  if ($button.getAttribute("aria-disabled") === "true") {
+    // Touch screens have no tooltip.
+    showNotice($button.title, "bulk-refused");
+    return;
+  }
+  const entries = selectedEntries();
+  if (entries.length === 0) return;
+  bulkBusy = true;
+  const $bar = $button.closest(".selection-bar");
+  $bar.setAttribute("aria-busy", "true");
+  try {
+    if (action === "download") await bulkDownload(entries);
+    else if (action === "move") await bulkMove(entries);
+    else if (action === "delete") await bulkDelete(entries);
+  } finally {
+    bulkBusy = false;
+    $bar.removeAttribute("aria-busy");
+  }
+}
+
+/**
+ * Leave the focus somewhere sensible once the entries it was on are gone.
+ */
+function focusListing() {
+  if (DATA.paths.length === 0) {
+    $emptyFolder.focus({ preventScroll: true });
+  } else {
+    $pathsTableHead.querySelector(".select-all").focus({ preventScroll: true });
+  }
+}
+
+/**
+ * Drop entries that are gone from the page, and fetch the listing again.
+ * @param {Set<string>} names
+ */
+function forgetEntries(names) {
+  DATA.paths = DATA.paths.filter(p => !names.has(p.name));
+  for (const name of names) selection.delete(name);
+  selectAnchor = null;
+  renderPathsTableBody(null);
+  focusListing();
+  refreshListing();
+}
+
+/**
+ * Delete the selected entries, one request after the other. Failures are
+ * collected and reported once.
+ * @param {PathItem[]} entries
+ */
+async function bulkDelete(entries) {
+  const hasDir = entries.some(entryIsDir);
+  const count = `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`;
+  const names = entries.slice(0, CONFIRM_LIST_MAX).map(file => entryIsDir(file) ? `${file.name}/` : file.name);
+  if (entries.length > CONFIRM_LIST_MAX) names.push(`and ${entries.length - CONFIRM_LIST_MAX} more`);
+  const confirmed = await confirmDialog(
+    `Delete ${count}?`,
+    `${hasDir ? "The selected entries, and everything in the folders among them, will" : "The selected entries will"} be deleted. This cannot be undone.`,
+    { danger: true, confirmLabel: "Delete", items: names },
+  );
+  if (!confirmed) return;
+  try {
+    await checkAuth();
+  } catch (err) {
+    showNotice(`Cannot delete, ${err.message}`);
+    return;
+  }
+  const deleted = new Set();
+  const failures = [];
+  for (const file of entries) {
+    try {
+      const res = await fetch(newUrl(file.name), { method: "DELETE" });
+      await assertResOK(res);
+      deleted.add(file.name);
+    } catch (err) {
+      failures.push(`${file.name} (${deleteBlockedReason(err) || err.message})`);
+    }
+  }
+  forgetEntries(deleted);
+  if (failures.length > 0) {
+    showNotice(`Could not delete ${failures.length} of ${entries.length}: ${failures.join("; ")}`);
+  }
+}
+
+/**
+ * Move the selected entries into a folder asked for once. An entry whose
+ * target exists is left where it is and reported, like any other failure.
+ * @param {PathItem[]} entries
+ */
+async function bulkMove(entries) {
+  const prefix = DATA.uri_prefix.slice(0, -1);
+  const here = decodeURIComponent(new URL(baseUrl()).pathname.slice(prefix.length)).replace(/\/+$/, "");
+  const toUrl = path => location.origin + prefix + path.split("/").map(encodeURIComponent).join("/");
+  const count = `${entries.length} ${entries.length === 1 ? "entry" : "entries"}`;
+
+  const initial = `${here}/`;
+  const value = await promptDialog(
+    `Move ${count}`,
+    "Destination folder",
+    initial,
+    value => {
+      if (!value) return { level: "error", message: "Enter a folder." };
+      const dest = normalizeMovePath(value);
+      if (dest.split("/").slice(1).some(s => s === "" || s === "." || s === "..")) {
+        return { level: "error", message: "A path cannot contain empty, \u201c.\u201d or \u201c..\u201d segments." };
+      }
+      if (entries.every(file => parentPath(`${here}/${file.name}`) === dest)) {
+        return { level: "error", message: "The selected entries are already in that folder." };
+      }
+      return null;
+    },
+    { confirmLabel: "Move", selection: [initial.length, initial.length] },
+  );
+  if (value === null) return;
+  const dest = normalizeMovePath(value);
+  try {
+    await checkAuth();
+  } catch (err) {
+    showNotice(`Cannot move, ${err.message}`);
+    return;
+  }
+
+  const moved = new Set();
+  const failures = [];
+  for (const file of entries) {
+    const from = `${here}/${file.name}`;
+    const to = `${dest}/${entryLeaf(file)}`;
+    try {
+      if (to === from) throw new Error("it is already there");
+      if (entryIsDir(file) && to.startsWith(`${from}/`)) throw new Error("a folder cannot move into itself");
+      const head = await fetch(toUrl(to), { method: "HEAD" });
+      if (head.status === 200) throw new Error("the target already exists");
+      const res = await fetch(newUrl(file.name), {
+        method: "MOVE",
+        headers: { "Destination": toUrl(to) },
+      });
+      await assertResOK(res);
+      moved.add(file.name);
+    } catch (err) {
+      failures.push(`${file.name} (${moveBlockedReason(err) || err.message})`);
+    }
+  }
+  forgetEntries(moved);
+  if (failures.length > 0) {
+    showNotice(`Could not move ${failures.length} of ${entries.length} to ${dest || "/"}: ${failures.join("; ")}`);
+  } else {
+    showNotice(`Moved ${count} to ${dest || "/"}.`, "bulk-moved", "info");
+  }
+}
+
+/**
+ * Download the selected entries one by one: files as they are, folders as
+ * .zip archives when the server offers them.
+ * @param {PathItem[]} entries
+ */
+async function bulkDownload(entries) {
+  const skipped = DATA.allow_archive ? [] : entries.filter(entryIsDir);
+  const items = entries.filter(file => !skipped.includes(file));
+  if (items.length > DOWNLOAD_CONFIRM_ABOVE) {
+    const confirmed = await confirmDialog(
+      `Download ${items.length} items?`,
+      `Download ${items.length} items one by one? Your browser may ask to allow multiple downloads.`,
+      { confirmLabel: "Download" },
+    );
+    if (!confirmed) return;
+  }
+  let started = 0;
+  const failures = [];
+  for (const file of items) {
+    if (started + failures.length > 0) await new Promise(resolve => setTimeout(resolve, DOWNLOAD_GAP_MS));
+    const isDir = entryIsDir(file);
+    try {
+      await startDownload(newUrl(file.name) + (isDir ? "/?zip" : ""), isDir ? `${entryLeaf(file)}.zip` : entryLeaf(file));
+      started++;
+    } catch (err) {
+      failures.push(`${file.name} (${err.message})`);
+    }
+  }
+  if (failures.length > 0) {
+    showNotice(`Could not download ${failures.length} of ${items.length}: ${failures.join("; ")}`);
+  }
+  if (skipped.length > 0) {
+    showNotice(`Skipped ${skipped.length} ${skipped.length === 1 ? "folder" : "folders"}: .zip download is disabled.`, "bulk-skipped", "info");
+  }
+  if (started > 1) {
+    // A page cannot tell that the browser dropped a download.
+    showNotice(
+      `Started ${started} downloads. If only the first arrived, your browser blocked the rest: allow multiple (automatic) downloads for this site, in the site permissions next to the address bar or in the browser settings, then try again.`,
+      "bulk-hint",
+      "info",
+    );
   }
 }
 
@@ -1536,15 +1958,24 @@ function showDialog($dialog) {
  * starts with the focus on Cancel.
  * @param {string} title
  * @param {string} body
- * @param {{danger?: boolean, confirmLabel?: string}} [options]
+ * @param {{danger?: boolean, confirmLabel?: string, items?: string[]}} [options]
+ * `items` are listed under the text
  * @returns {Promise<boolean>}
  */
-function confirmDialog(title, body, { danger = false, confirmLabel = "OK" } = {}) {
+function confirmDialog(title, body, { danger = false, confirmLabel = "OK", items } = {}) {
   const d = createDialog(title, confirmLabel, danger);
   const $text = createElement("p", "dialog-text", body);
   $text.id = `dialog-text-${d.id}`;
-  d.$dialog.setAttribute("aria-describedby", $text.id);
+  let describedBy = $text.id;
   d.$body.append($text);
+  if (items) {
+    const $list = createElement("ul", "dialog-list");
+    $list.id = `dialog-list-${d.id}`;
+    for (const item of items) $list.append(createElement("li", undefined, item));
+    d.$body.append($list);
+    describedBy += ` ${$list.id}`;
+  }
+  d.$dialog.setAttribute("aria-describedby", describedBy);
   d.$form.addEventListener("submit", e => {
     e.preventDefault();
     d.$dialog.close("ok");
@@ -1679,11 +2110,13 @@ function promptDialog(title, label, initial, validate, { confirmLabel = "OK", se
  * same key is replaced; the key defaults to the message.
  * @param {string} message
  * @param {string} [key]
+ * @param {"error" | "info"} [level]
  */
-function showNotice(message, key = message) {
+function showNotice(message, key = message, level = "error") {
   clearNotice(key);
   const $notice = createElement("div", "notice");
   $notice.dataset.key = key;
+  $notice.dataset.level = level;
   const $dismiss = createElement("button", "notice-dismiss", "\u00d7");
   $dismiss.type = "button";
   $dismiss.setAttribute("aria-label", "Dismiss");

@@ -11,6 +11,7 @@
   --text-error: #b31d28;
   --text-warn: #8a5a00;
   --on-accent: #fff;
+  --bg-selected: #e6f0fb;
   --svg-primary: #24292e;
   --svg-secondary: rgba(3, 47, 98, 0.5);
   --svg-tertiary: #24292e;
@@ -53,6 +54,9 @@ svg {
   align-items: center;
   padding: 0.6em 1em;
   position: sticky;
+  /* Above the list rows that are faded (opacity makes them a stacking
+     context), so they do not show through the header while scrolling. */
+  z-index: 1;
   top: 0;
   background-color: var(--bg-tertiary);
 }
@@ -201,6 +205,10 @@ svg {
   background: var(--border-primary);
 }
 
+.notice[data-level="info"] {
+  border-color: var(--text-accent);
+}
+
 .dialog {
   box-sizing: border-box;
   width: min(32rem, calc(100vw - 2rem));
@@ -310,6 +318,12 @@ svg {
   cursor: progress;
 }
 
+.dialog-list {
+  margin: 0.5em 0 0;
+  padding-left: 1.5em;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 900px) {
   .dialog-btn {
     flex: 1 1 auto;
@@ -374,6 +388,87 @@ svg {
   background-color: var(--bg-hover);
 }
 
+.paths-table tbody tr.selected,
+.paths-table tbody tr.selected:hover {
+  background-color: var(--bg-selected);
+}
+
+/* The checkbox column. The label is the hit area; the box is native, so it
+   keeps its own keyboard and screen-reader behaviour. */
+.paths-table .cell-select {
+  width: 1.5em;
+  padding-right: 0.25em;
+  user-select: none;
+}
+
+.select-box {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3em;
+  cursor: pointer;
+}
+
+.select-box input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--text-accent);
+  cursor: pointer;
+}
+
+.select-all-text {
+  display: none;
+}
+
+/* The bar lives in the sticky header, so it stays in view while the list
+   scrolls. */
+.selection-bar {
+  display: flex;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4em;
+  margin-top: 0.4em;
+  padding: 0.2em 0.6em;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.selection-count {
+  margin-right: auto;
+  padding-right: 0.5em;
+  font-weight: 600;
+}
+
+.bulk-btn {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 1em;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.bulk-btn.danger {
+  border-color: var(--text-error);
+  color: var(--text-error);
+}
+
+.bulk-btn[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.selection-bar[aria-busy="true"] .bulk-btn {
+  opacity: 0.6;
+  cursor: progress;
+}
+
 .paths-table .cell-actions {
   /* Five fixed slots, so the same action lines up on every row whether the row
      has three buttons (a folder) or five (a file). */
@@ -419,7 +514,7 @@ svg {
   overflow: hidden;
   display: block;
   text-decoration: none;
-  max-width: calc(100vw - 375px);
+  max-width: calc(100vw - 405px);
   min-width: 170px;
 }
 
@@ -641,6 +736,18 @@ button.toolbox-right,
     padding: 0 0.4em;
   }
 
+  /* The count takes a line, so four 44px buttons share the next one. */
+  .selection-count {
+    flex: 1 0 100%;
+    margin-right: 0;
+    padding-right: 0;
+  }
+
+  .bulk-btn {
+    flex: 1 1 auto;
+    padding: 0 0.4em;
+  }
+
   .toolbox-right {
     margin: 0 0 0 auto;
   }
@@ -700,6 +807,19 @@ button.toolbox-right,
     display: none;
   }
 
+  /* Select all is a chip like the sort links, with its label shown. */
+  .paths-table thead .select-box {
+    gap: 0.4em;
+    min-height: 44px;
+    padding: 0 0.6em;
+    border: 1px solid var(--border-primary);
+    border-radius: 15px;
+  }
+
+  .select-all-text {
+    display: inline;
+  }
+
   .paths-table thead a {
     display: inline-flex;
     align-items: center;
@@ -720,7 +840,7 @@ button.toolbox-right,
 
   .paths-table tbody tr {
     display: grid;
-    grid-template-columns: 22px minmax(0, 1fr);
+    grid-template-columns: 44px 22px minmax(0, 1fr);
     padding: 0.5em 0;
     border-bottom: 1px solid var(--border-primary);
   }
@@ -729,13 +849,25 @@ button.toolbox-right,
     padding: 0;
   }
 
-  .paths-table .cell-icon {
+  .paths-table .cell-select {
     grid-area: 1 / 1;
+    width: auto;
+    padding: 0;
+  }
+
+  .paths-table .select-box {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+  }
+
+  .paths-table .cell-icon {
+    grid-area: 1 / 2;
     padding-top: 0.35em;
   }
 
   .paths-table .cell-name {
-    grid-area: 1 / 2;
+    grid-area: 1 / 3;
   }
 
   .paths-table td.cell-mtime,
@@ -744,7 +876,7 @@ button.toolbox-right,
   }
 
   .paths-table .cell-actions {
-    grid-area: 2 / 2;
+    grid-area: 2 / 3;
     display: grid;
     grid-auto-flow: column;
     grid-auto-columns: 44px;
@@ -884,6 +1016,7 @@ button.toolbox-right,
     --bg-secondary: #111;
     --bg-tertiary: #111;
     --bg-hover: #1a1a1a;
+    --bg-selected: #0d2238;
     --text-primary: #fff;
     --text-secondary: #ddd;
     /* Was #586069 in both schemes: 3.3:1 on black, under the 4.5 a text token
