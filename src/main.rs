@@ -110,20 +110,22 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                                 let Ok((stream, addr)) = listener.accept().await else {
                                     continue;
                                 };
-                                let Some(stream) =
-                                    timeout(handshake_timeout, tls_accepter.accept(stream))
-                                        .await
-                                        .ok()
-                                        .and_then(|v| v.ok())
-                                else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
+                                // Handshake in the per-connection task so a stalled
+                                // client cannot block the accept loop.
+                                let tls_accepter = tls_accepter.clone();
+                                let server_handle = server_handle.clone();
+                                tokio::spawn(async move {
+                                    let Some(stream) =
+                                        timeout(handshake_timeout, tls_accepter.accept(stream))
+                                            .await
+                                            .ok()
+                                            .and_then(|v| v.ok())
+                                    else {
+                                        return;
+                                    };
+                                    handle_stream(server_handle, TokioIo::new(stream), Some(addr))
+                                        .await;
+                                });
                             }
                         });
 
