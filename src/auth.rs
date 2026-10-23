@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 const REALM: &str = "DUFS";
@@ -49,6 +50,10 @@ lazy_static! {
     /// relies on this table: a nonce may be used many times (with increasing
     /// counts), but the same count must never be accepted twice.
     static ref NONCE_COUNTS: Mutex<HashMap<String, UserNonces>> = Mutex::new(HashMap::new());
+    /// Password used for the dummy verification of unknown users when no
+    /// configured user has a sha512-crypt hash. Random per process, so a
+    /// client cannot compute credentials that satisfy it.
+    static ref DUMMY_PASSWORD: String = Uuid::new_v4().to_string();
 }
 
 /// Replay state of a single user's Digest nonces.
@@ -74,6 +79,9 @@ struct NonceEntry {
 pub struct AccessControl {
     empty: bool,
     use_hashed_password: bool,
+    /// First configured `$6$` hash. Unknown users are verified against it so
+    /// that they cost as much as a wrong password for a hashed user.
+    dummy_hash: Option<String>,
     users: IndexMap<String, (String, AccessPaths)>,
     anonymous: Option<AccessPaths>,
     /// Server-side secret that share-token signing keys derive from. Random
@@ -86,6 +94,7 @@ impl Default for AccessControl {
         AccessControl {
             empty: true,
             use_hashed_password: false,
+            dummy_hash: None,
             users: IndexMap::new(),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
             token_secret: random_token_secret(),
@@ -99,7 +108,7 @@ impl AccessControl {
             return Ok(Self::default());
         }
         let new_raw_rules = split_rules(raw_rules);
-        let mut use_hashed_password = false;
+        let mut dummy_hash = None;
         let mut annoy_paths = None;
         let mut account_paths_pairs = vec![];
         for rule in &new_raw_rules {
@@ -140,15 +149,16 @@ impl AccessControl {
                     AccessPerm::IndexOnly,
                 );
             }
-            if pass.starts_with("$6$") {
-                use_hashed_password = true;
+            if pass.starts_with("$6$") && dummy_hash.is_none() {
+                dummy_hash = Some(pass.to_string());
             }
             users.insert(user.to_string(), (pass.to_string(), access_paths));
         }
 
         Ok(Self {
             empty: false,
-            use_hashed_password,
+            use_hashed_password: dummy_hash.is_some(),
+            dummy_hash,
             users,
             anonymous,
             token_secret: random_token_secret(),
@@ -185,6 +195,13 @@ impl AccessControl {
             None => self.anonymous.as_ref(),
         };
         ap?.guard(path, method, Some(root)).await
+    }
+
+    /// Password to verify against when the client names a user that does not
+    /// exist: a configured `$6$` hash if there is one, so the dummy check
+    /// pays for sha512-crypt like a real one, otherwise a random string.
+    fn dummy_pass(&self) -> &str {
+        self.dummy_hash.as_deref().unwrap_or(&DUMMY_PASSWORD)
     }
 
     /// Returns the guarded `(user, access_paths, via_token, stale)`. `via_token`
@@ -231,27 +248,48 @@ impl AccessControl {
 
         if let Some(authorization) = authorization {
             if let Some(user) = get_auth_user(authorization) {
-                if let Some((pass, ap)) = self.users.get(&user) {
-                    match check_auth(authorization, method.as_str(), request_target, &user, pass) {
-                        AuthResult::Valid => {
-                            if method == Method::OPTIONS {
-                                return (
-                                    Some(user),
-                                    Some(AccessPaths::new(AccessPerm::ReadOnly)),
-                                    false,
-                                    false,
-                                );
-                            }
+                let Some((pass, ap)) = self.users.get(&user) else {
+                    // Do the work of a real check so the response time does
+                    // not reveal which usernames exist. The result is
+                    // discarded and no replay state is recorded: a client
+                    // that knows a configured `$6$` hash can satisfy the
+                    // check under any made-up username.
+                    let _ = check_auth(
+                        authorization,
+                        method.as_str(),
+                        request_target,
+                        &user,
+                        self.dummy_pass(),
+                        false,
+                    );
+                    return (None, None, false, false);
+                };
+                match check_auth(
+                    authorization,
+                    method.as_str(),
+                    request_target,
+                    &user,
+                    pass,
+                    true,
+                ) {
+                    AuthResult::Valid => {
+                        if method == Method::OPTIONS {
                             return (
                                 Some(user),
-                                ap.guard(path, method, Some(root)).await,
+                                Some(AccessPaths::new(AccessPerm::ReadOnly)),
                                 false,
                                 false,
                             );
                         }
-                        AuthResult::Stale => return (None, None, false, true),
-                        AuthResult::Invalid => {}
+                        return (
+                            Some(user),
+                            ap.guard(path, method, Some(root)).await,
+                            false,
+                            false,
+                        );
                     }
+                    AuthResult::Stale => return (None, None, false, true),
+                    AuthResult::Invalid => {}
                 }
             }
 
@@ -727,12 +765,24 @@ pub enum AuthResult {
     Invalid,
 }
 
+/// Compare secrets without leaking, through timing, where they differ or how
+/// long the expected one is. Both sides are hashed to a fixed length first,
+/// because `ConstantTimeEq` on slices of different lengths returns early.
+fn secure_eq(a: &[u8], b: &[u8]) -> bool {
+    Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
+}
+
+/// Verify an `Authorization` header against `auth_user`/`auth_pass`. With
+/// `record` set, a successful Digest check also records its nonce count for
+/// replay protection; pass `false` for dummy verifications that must not
+/// change state.
 pub fn check_auth(
     authorization: &HeaderValue,
     method: &str,
     request_target: &str,
     auth_user: &str,
     auth_pass: &str,
+    record: bool,
 ) -> AuthResult {
     if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
         let Some(value) = STANDARD.decode(value).ok() else {
@@ -756,13 +806,13 @@ pub fn check_auth(
             {
                 return AuthResult::Valid;
             }
-        } else if pass == auth_pass {
+        } else if secure_eq(pass.as_bytes(), auth_pass.as_bytes()) {
             return AuthResult::Valid;
         }
 
         AuthResult::Invalid
     } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
-        check_digest_auth(value, method, request_target, auth_user, auth_pass)
+        check_digest_auth(value, method, request_target, auth_user, auth_pass, record)
             .unwrap_or(AuthResult::Invalid)
     } else {
         AuthResult::Invalid
@@ -777,6 +827,7 @@ fn check_digest_auth(
     request_target: &str,
     auth_user: &str,
     auth_pass: &str,
+    record: bool,
 ) -> Option<AuthResult> {
     let digest_map = to_headermap(value).ok()?;
     let username = digest_map
@@ -837,7 +888,7 @@ fn check_digest_auth(
     c.consume(&*ha);
     let correct_response = format!("{:x}", c.finalize());
 
-    if correct_response.as_bytes() != *user_response {
+    if !secure_eq(correct_response.as_bytes(), user_response) {
         return Some(AuthResult::Invalid);
     }
 
@@ -850,7 +901,7 @@ fn check_digest_auth(
 
     // Only record the nonce count once the response has been verified, so
     // unauthenticated clients cannot grow the table.
-    if !record_nonce_count(std::str::from_utf8(nonce).ok()?, auth_user, nc) {
+    if record && !record_nonce_count(std::str::from_utf8(nonce).ok()?, auth_user, nc) {
         return Some(AuthResult::Invalid);
     }
     Some(AuthResult::Valid)
@@ -1555,12 +1606,12 @@ mod tests {
         let nonce = nonce_with_offset(10);
         let auth = digest_authorization(user, "pass", &nonce, "/public/hello.txt", "00000001");
         assert_eq!(
-            check_auth(&auth, "GET", "/public/hello.txt", user, "pass"),
+            check_auth(&auth, "GET", "/public/hello.txt", user, "pass", true),
             AuthResult::Valid
         );
         // the same header must not authenticate a different resource
         assert_eq!(
-            check_auth(&auth, "GET", "/private/secret.txt", user, "pass"),
+            check_auth(&auth, "GET", "/private/secret.txt", user, "pass", true),
             AuthResult::Invalid
         );
     }
@@ -1571,12 +1622,12 @@ mod tests {
         let nonce = nonce_with_offset(20);
         let auth = digest_authorization(user, "pass", &nonce, "/dir/?simple", "00000001");
         assert_eq!(
-            check_auth(&auth, "GET", "/dir/?simple", user, "pass"),
+            check_auth(&auth, "GET", "/dir/?simple", user, "pass", true),
             AuthResult::Valid
         );
         // query flags such as ?zip must be covered by the digest too
         assert_eq!(
-            check_auth(&auth, "GET", "/dir/?zip", user, "pass"),
+            check_auth(&auth, "GET", "/dir/?zip", user, "pass", true),
             AuthResult::Invalid
         );
     }
@@ -1587,30 +1638,30 @@ mod tests {
         let nonce = nonce_with_offset(30);
         let auth = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&auth, "GET", "/file.txt", user, "pass"),
+            check_auth(&auth, "GET", "/file.txt", user, "pass", true),
             AuthResult::Valid
         );
         // replaying the exact same header must fail
         assert_eq!(
-            check_auth(&auth, "GET", "/file.txt", user, "pass"),
+            check_auth(&auth, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
         // a higher nonce count is accepted
         let next = digest_authorization(user, "pass", &nonce, "/file.txt", "00000002");
         assert_eq!(
-            check_auth(&next, "GET", "/file.txt", user, "pass"),
+            check_auth(&next, "GET", "/file.txt", user, "pass", true),
             AuthResult::Valid
         );
         // and going backwards is a replay
         let older = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&older, "GET", "/file.txt", user, "pass"),
+            check_auth(&older, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
         // malformed / non-8-digit counts are rejected
         let malformed = digest_authorization(user, "pass", &nonce, "/file.txt", "000003");
         assert_eq!(
-            check_auth(&malformed, "GET", "/file.txt", user, "pass"),
+            check_auth(&malformed, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
     }
@@ -1621,11 +1672,11 @@ mod tests {
         let alice = digest_authorization("alice", "pass", &nonce, "/file.txt", "00000001");
         let bob = digest_authorization("bob", "pass", &nonce, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&alice, "GET", "/file.txt", "alice", "pass"),
+            check_auth(&alice, "GET", "/file.txt", "alice", "pass", true),
             AuthResult::Valid
         );
         assert_eq!(
-            check_auth(&bob, "GET", "/file.txt", "bob", "pass"),
+            check_auth(&bob, "GET", "/file.txt", "bob", "pass", true),
             AuthResult::Valid
         );
     }
@@ -1638,7 +1689,7 @@ mod tests {
         let bob_nonce = nonce_with_offset(50);
         let bob = digest_authorization("flood-bob", "pass", &bob_nonce, uri, "00000001");
         assert_eq!(
-            check_auth(&bob, "GET", uri, "flood-bob", "pass"),
+            check_auth(&bob, "GET", uri, "flood-bob", "pass", true),
             AuthResult::Valid
         );
 
@@ -1650,7 +1701,7 @@ mod tests {
             let nonce = nonce_at(base + (i / 4) as u32, i + 1000);
             let auth = digest_authorization("flood-alice", "pass", &nonce, uri, "00000001");
             assert_eq!(
-                check_auth(&auth, "GET", uri, "flood-alice", "pass"),
+                check_auth(&auth, "GET", uri, "flood-alice", "pass", true),
                 AuthResult::Valid,
                 "nonce {i}"
             );
@@ -1659,12 +1710,12 @@ mod tests {
 
         // Bob's replay state survived Alice's flood.
         assert_eq!(
-            check_auth(&bob, "GET", uri, "flood-bob", "pass"),
+            check_auth(&bob, "GET", uri, "flood-bob", "pass", true),
             AuthResult::Invalid
         );
         // Alice's oldest nonce was evicted. Replaying it must still fail.
         assert_eq!(
-            check_auth(&first.unwrap(), "GET", uri, "flood-alice", "pass"),
+            check_auth(&first.unwrap(), "GET", uri, "flood-alice", "pass", true),
             AuthResult::Invalid
         );
         // The newest nonce is still tracked and still protected.
@@ -1674,7 +1725,7 @@ mod tests {
         );
         let last = digest_authorization("flood-alice", "pass", &last, uri, "00000001");
         assert_eq!(
-            check_auth(&last, "GET", uri, "flood-alice", "pass"),
+            check_auth(&last, "GET", uri, "flood-alice", "pass", true),
             AuthResult::Invalid
         );
         // Unused newer nonces keep working.
@@ -1686,7 +1737,7 @@ mod tests {
             "00000001",
         );
         assert_eq!(
-            check_auth(&fresh, "GET", uri, "flood-alice", "pass"),
+            check_auth(&fresh, "GET", uri, "flood-alice", "pass", true),
             AuthResult::Valid
         );
     }
@@ -1697,19 +1748,19 @@ mod tests {
         let nonce = nonce_with_offset(DIGEST_AUTH_TIMEOUT + 60);
         let auth = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&auth, "GET", "/file.txt", user, "pass"),
+            check_auth(&auth, "GET", "/file.txt", user, "pass", true),
             AuthResult::Stale
         );
 
         // Only a valid digest gets the stale hint.
         let wrong_pass = digest_authorization(user, "wrong", &nonce, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&wrong_pass, "GET", "/file.txt", user, "pass"),
+            check_auth(&wrong_pass, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
         let wrong_uri = digest_authorization(user, "pass", &nonce, "/other.txt", "00000001");
         assert_eq!(
-            check_auth(&wrong_uri, "GET", "/file.txt", user, "pass"),
+            check_auth(&wrong_uri, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
 
@@ -1720,9 +1771,170 @@ mod tests {
         let tampered = std::str::from_utf8(&tampered).unwrap().to_string();
         let forged = digest_authorization(user, "pass", &tampered, "/file.txt", "00000001");
         assert_eq!(
-            check_auth(&forged, "GET", "/file.txt", user, "pass"),
+            check_auth(&forged, "GET", "/file.txt", user, "pass", true),
             AuthResult::Invalid
         );
+    }
+
+    const HASHED: &str = "$6$gQxZwKyWn/ZmWEA2$4uV7KKMnSUnET2BtWTj/9T5.Jq3h/MdkOlnIl5hdlTxDZ4MZKmJ.kl6C.NL9xnNPqC4lVHC1vuI0E5cLpTJX81";
+
+    fn basic_authorization(user: &str, pass: &str) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "Basic {}",
+            STANDARD.encode(format!("{user}:{pass}"))
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_secure_eq() {
+        assert!(secure_eq(b"", b""));
+        assert!(secure_eq(b"pass", b"pass"));
+        assert!(!secure_eq(b"pass", b"pasS"));
+        assert!(!secure_eq(b"pass", b"pas"));
+        assert!(!secure_eq(b"pas", b"pass"));
+        assert!(!secure_eq(b"pass", b""));
+    }
+
+    #[test]
+    fn test_basic_compares_plain_password() {
+        let auth = basic_authorization("user", "pass");
+        assert_eq!(
+            check_auth(&auth, "GET", "/", "user", "pass", true),
+            AuthResult::Valid
+        );
+        for wrong in ["pas", "passs", "Pass", "other"] {
+            assert_eq!(
+                check_auth(&auth, "GET", "/", "user", wrong, true),
+                AuthResult::Invalid,
+                "{wrong}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_basic_verifies_hashed_password() {
+        let auth = basic_authorization("user", "pass");
+        assert_eq!(
+            check_auth(&auth, "GET", "/", "user", HASHED, true),
+            AuthResult::Valid
+        );
+        let wrong = basic_authorization("user", "pass2");
+        assert_eq!(
+            check_auth(&wrong, "GET", "/", "user", HASHED, true),
+            AuthResult::Invalid
+        );
+    }
+
+    #[test]
+    fn test_digest_compares_response() {
+        let user = "cmp-user";
+        let nonce = nonce_with_offset(10);
+        let auth = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
+        let text = auth.to_str().unwrap();
+        let start = text.find("response=\"").unwrap() + "response=\"".len();
+        let end = start + text[start..].find('"').unwrap();
+        let response = &text[start..end];
+
+        let altered = |response: String| {
+            HeaderValue::from_str(&format!("{}{response}{}", &text[..start], &text[end..])).unwrap()
+        };
+        // truncated, extended and last-character-flipped responses
+        let mut flipped = response.to_string();
+        let last = flipped.pop().unwrap();
+        flipped.push(if last == '0' { '1' } else { '0' });
+        for wrong in [
+            response[..response.len() - 1].to_string(),
+            format!("{response}0"),
+            flipped,
+        ] {
+            assert_eq!(
+                check_auth(&altered(wrong), "GET", "/file.txt", user, "pass", true),
+                AuthResult::Invalid
+            );
+        }
+        assert_eq!(
+            check_auth(
+                &altered(response.to_string()),
+                "GET",
+                "/file.txt",
+                user,
+                "pass",
+                true
+            ),
+            AuthResult::Valid
+        );
+    }
+
+    #[test]
+    fn test_dummy_pass_matches_configured_hash() {
+        let plain = AccessControl::new(&["user:pass@/:rw"]).unwrap();
+        assert_eq!(plain.dummy_pass(), DUMMY_PASSWORD.as_str());
+        assert!(!plain.dummy_pass().starts_with("$6$"));
+
+        let rule = format!("user:{HASHED}@/:rw");
+        let hashed = AccessControl::new(&["other:pass@/:rw", &rule]).unwrap();
+        assert_eq!(hashed.dummy_pass(), HASHED);
+    }
+
+    #[tokio::test]
+    async fn test_guard_unknown_user_is_denied() {
+        let rule = format!("user:{HASHED}@/:rw");
+        for rules in [vec!["user:pass@/:rw"], vec![rule.as_str()]] {
+            let ac = AccessControl::new(&rules).unwrap();
+            let root = Path::new(".");
+            // The unknown user sends the real user's password; it must still
+            // be rejected, as must the dummy password's own value.
+            for pass in ["pass", ac.dummy_pass()] {
+                let auth = basic_authorization("nobody", pass);
+                let (user, ap, _, stale) = ac
+                    .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                    .await;
+                assert!(user.is_none() && ap.is_none() && !stale);
+            }
+            let nonce = nonce_with_offset(10);
+            let auth = digest_authorization("nobody", ac.dummy_pass(), &nonce, "/", "00000001");
+            let (user, ap, _, stale) = ac
+                .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                .await;
+            assert!(user.is_none() && ap.is_none() && !stale);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_guard_unknown_user_records_no_nonce_state() {
+        // Anyone who knows a configured `$6$` hash can compute a valid Digest
+        // response for it under any username. The dummy check must not let
+        // such requests grow the replay table.
+        let rule = format!("user:{HASHED}@/:rw");
+        let ac = AccessControl::new(&[rule.as_str()]).unwrap();
+        let root = Path::new(".");
+        let nonce = nonce_with_offset(31);
+        for i in 0..5 {
+            let ghost = format!("no-record-ghost-{i}");
+            let auth = digest_authorization(&ghost, ac.dummy_pass(), &nonce, "/", "00000001");
+            let (user, ap, _, stale) = ac
+                .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                .await;
+            assert!(user.is_none() && ap.is_none() && !stale);
+        }
+        let recorded = NONCE_COUNTS
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|user| user.starts_with("no-record-ghost-"))
+            .count();
+        assert_eq!(recorded, 0);
+
+        // A configured user is still recorded, so replays are still caught.
+        let ac = AccessControl::new(&["user:pass@/:rw"]).unwrap();
+        let auth = digest_authorization("user", "pass", &nonce, "/", "00000001");
+        for expected in [Some("user".to_string()), None] {
+            let (user, ..) = ac
+                .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                .await;
+            assert_eq!(user, expected);
+        }
     }
 
     #[test]
