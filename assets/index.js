@@ -126,10 +126,19 @@ let saveStatusTimer;
  * @type {string|null}
  */
 let editorEtag = null;
+/**
+ * Editor content as last loaded or saved; the editor is dirty when it differs.
+ * @type {string}
+ */
+let editorSavedValue = "";
+/**
+ * Whether Tab inserts a tab character instead of moving focus.
+ */
+let editorTabTrap = true;
 
-// manage unload event to prevent leaving with uploads in progress
+// manage unload event to prevent leaving with uploads in progress or unsaved edits
 const beforeUnloadHandler = (event) => {
-  if (Uploader.queues.length > 0 || Uploader.runnings > 0) {
+  if (Uploader.queues.length > 0 || Uploader.runnings > 0 || isEditorDirty()) {
     event.preventDefault();
     event.returnValue = '';
     return ''; // for some browsers
@@ -833,7 +842,12 @@ async function setupEditorPage() {
       $saveBtn.addEventListener("click", () => saveChange(false));
       $overwriteBtn = document.querySelector(".editor-overwrite-btn");
       $overwriteBtn.addEventListener("click", () => saveChange(true));
-      document.querySelector(".editor-reload-btn").addEventListener("click", () => location.reload());
+      document.querySelector(".editor-reload-btn").addEventListener("click", () => {
+        // the user chose to discard their edits, so do not warn about them
+        editorSavedValue = $editor.value;
+        location.reload();
+      });
+      document.addEventListener("keydown", saveShortcutHandler);
     }
   }
 
@@ -855,6 +869,11 @@ async function setupEditorPage() {
   $editor.readOnly = readOnly;
   if (readOnly) {
     $editor.setAttribute("aria-label", "File contents (read-only)");
+  } else {
+    $editor.setAttribute("aria-describedby", "editor-hint");
+    $editor.addEventListener("keydown", editorTabHandler);
+    $editor.addEventListener("focus", () => { editorTabTrap = true; });
+    $editor.addEventListener("input", updateDirtyState);
   }
   try {
     const res = await fetch(baseUrl());
@@ -869,6 +888,7 @@ async function setupEditorPage() {
       const decoder = new TextDecoder(encoding);
       $editor.value = decoder.decode(dataView);
     }
+    editorSavedValue = $editor.value;
   } catch (err) {
     alert(`Failed to get file, ${err.message}`);
   }
@@ -988,12 +1008,15 @@ async function saveChange(overwrite) {
     if (editorEtag && !overwrite) {
       headers["If-Match"] = editorEtag;
     }
+    const body = $editor.value;
     const res = await fetch(baseUrl(), {
       method: "PUT",
       headers,
-      body: $editor.value,
+      body,
     });
     await assertResOK(res);
+    editorSavedValue = body;
+    updateDirtyState();
     editorEtag = await fetchEtag();
     $saveStatus.textContent = "Saved";
     saveStatusTimer = setTimeout(() => {
@@ -1018,6 +1041,54 @@ async function saveChange(overwrite) {
     $saveBtn.disabled = false;
     $overwriteBtn.disabled = false;
     if (hadFocus || overwrite) $saveBtn.focus();
+  }
+}
+
+/**
+ * Whether the editor holds changes that were neither loaded nor saved.
+ */
+function isEditorDirty() {
+  return !$editor.readOnly && $editor.value !== editorSavedValue;
+}
+
+/**
+ * Reflect the dirty state on the Save button.
+ */
+function updateDirtyState() {
+  if (!$saveBtn) return;
+  const dirty = isEditorDirty();
+  $saveBtn.querySelector(".save-dirty").classList.toggle("hidden", !dirty);
+  const label = dirty ? "Save file, unsaved changes" : "Save file";
+  $saveBtn.setAttribute("aria-label", label);
+  $saveBtn.title = label;
+}
+
+/**
+ * Ctrl+S / Cmd+S saves instead of opening the browser's save dialog.
+ * @param {KeyboardEvent} event
+ */
+function saveShortcutHandler(event) {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== "s") return;
+  event.preventDefault();
+  if (!$saveBtn.disabled) saveChange(false);
+}
+
+/**
+ * Tab inserts a tab character while trapping is on; Escape or Ctrl+M turns
+ * trapping off so keyboard users can leave the field.
+ * @param {KeyboardEvent} event
+ */
+function editorTabHandler(event) {
+  if (event.key === "Escape" || (event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "m")) {
+    event.preventDefault();
+    editorTabTrap = !editorTabTrap;
+    return;
+  }
+  if (event.key !== "Tab" || !editorTabTrap || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+  event.preventDefault();
+  if (!document.execCommand("insertText", false, "\t")) {
+    $editor.setRangeText("\t", $editor.selectionStart, $editor.selectionEnd, "end");
+    $editor.dispatchEvent(new Event("input", { bubbles: true }));
   }
 }
 
