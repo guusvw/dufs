@@ -9,6 +9,8 @@
   --text-tertiary: #586069;
   --text-accent: #0366d6;
   --text-error: #b31d28;
+  --text-warn: #8a5a00;
+  --on-accent: #fff;
   --svg-primary: #24292e;
   --svg-secondary: rgba(3, 47, 98, 0.5);
   --svg-tertiary: #24292e;
@@ -159,9 +161,158 @@ svg {
   font-style: italic;
 }
 
-.listing-error {
-  color: var(--text-error);
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5em;
+  margin: 0.5em 0;
+  padding: 0 0.25em 0 0.75em;
+  border: 1px solid var(--text-error);
+  border-left-width: 4px;
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  /* Keep a notice that is scrolled into view clear of the sticky header. */
+  scroll-margin-top: 8em;
+}
+
+.notice-text {
+  flex: 1;
+  align-self: center;
   padding: 0.5em 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.notice-dismiss {
+  flex: none;
+  min-width: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notice-dismiss:hover {
+  background: var(--border-primary);
+}
+
+.dialog {
+  box-sizing: border-box;
+  width: min(32rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  padding: 1em 1.25em;
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dialog-title {
+  margin: 0 0 0.5em;
+  font-size: 1.15em;
+}
+
+.dialog-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.dialog-label {
+  display: block;
+  margin-bottom: 0.25em;
+  color: var(--text-secondary);
+}
+
+.dialog-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 0.6em;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.dialog-msg {
+  /* Reserve the line so the dialog does not jump when a message appears. */
+  min-height: 1.5em;
+  margin: 0.25em 0 0;
+  overflow-wrap: anywhere;
+}
+
+.dialog-msg[data-level="error"] {
+  color: var(--text-error);
+}
+
+.dialog-msg[data-level="warn"] {
+  color: var(--text-warn);
+}
+
+.dialog-ack {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.dialog-ack input {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: 0;
+}
+
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5em;
+  margin-top: 1em;
+}
+
+.dialog-btn {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 1.1em;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.dialog-ok {
+  border-color: var(--text-accent);
+  background: var(--text-accent);
+  color: var(--on-accent);
+}
+
+.dialog-ok.danger {
+  border-color: var(--text-error);
+  background: var(--text-error);
+}
+
+.dialog-ok[aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (max-width: 900px) {
+  .dialog-btn {
+    flex: 1 1 auto;
+  }
 }
 
 .uploaders-table th,
@@ -675,6 +826,8 @@ button.toolbox-right,
     --text-tertiary: #9aa4ad;
     --text-accent: #3191ff;
     --text-error: #ff7b72;
+    --text-warn: #e3b341;
+    --on-accent: #000;
     --svg-primary: #fff;
     --svg-secondary: #fff;
     --svg-tertiary: #ffffff99;
