@@ -1,18 +1,31 @@
 :root {
+  /* One definition of every token: light-dark() picks the first value in a
+     light scheme and the second in a dark one. With no data-theme override the
+     scheme follows the OS; [data-theme] pins it (the two rules below). */
+  color-scheme: light dark;
+  --bg-primary: light-dark(#fff, #000);
+  --bg-secondary: light-dark(#fafafa, #111);
+  --bg-tertiary: light-dark(#fff, #111);
+  --bg-hover: light-dark(#fafafa, #1a1a1a);
+  --text-primary: light-dark(#24292e, #fff);
+  --text-secondary: light-dark(#5c5c5c, #ddd);
+  /* Was #586069 in both schemes: 3.3:1 on black, under the 4.5 a text token
+     needs. Lightened for dark only; #586069 stays as the light colour. */
+  --text-tertiary: light-dark(#586069, #9aa4ad);
+  --text-accent: light-dark(#0366d6, #3191ff);
+  --svg-primary: light-dark(#24292e, #fff);
+  --svg-secondary: light-dark(rgba(3, 47, 98, 0.5), #fff);
+  --svg-tertiary: light-dark(#24292e, #ffffff99);
+  --border-primary: light-dark(#ddd, #ffffff40);
+  --border-secondary: #ced4da; /* Unchanged in both color schemes */
+}
+
+:root[data-theme="light"] {
   color-scheme: light;
-  --bg-primary: #fff;
-  --bg-secondary: #fafafa;
-  --bg-tertiary: #fff;
-  --bg-hover: #fafafa;
-  --text-primary: #24292e;
-  --text-secondary: #5c5c5c;
-  --text-tertiary: #586069;
-  --text-accent: #0366d6;
-  --svg-primary: #24292e;
-  --svg-secondary: rgba(3, 47, 98, 0.5);
-  --svg-tertiary: #24292e;
-  --border-primary: #ddd;
-  --border-secondary: #ced4da;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 html {
@@ -339,10 +352,14 @@ textarea:focus-visible,
 }
 
 .toolbox-right {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
   margin-left: auto;
   margin-right: 2em;
 }
 
+.theme-btn,
 .login-btn,
 .logout-btn,
 .save-btn {
@@ -356,6 +373,7 @@ textarea:focus-visible,
 
 button.toolbox-right,
 .save-btn svg,
+.theme-btn svg,
 .login-btn svg,
 .logout-btn svg {
   display: block;
@@ -426,6 +444,15 @@ button.toolbox-right,
 
   .toolbox-right {
     margin: 0 0 0 auto;
+    gap: 0.25em;
+  }
+
+  .theme-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .searchbar {
@@ -651,27 +678,5 @@ button.toolbox-right,
 @media (min-width: 901px) {
   .path a {
     min-width: 400px;
-  }
-}
-
-/* dark theme */
-@media (prefers-color-scheme: dark) {
-  :root {
-    color-scheme: dark;
-    --bg-primary: #000;
-    --bg-secondary: #111;
-    --bg-tertiary: #111;
-    --bg-hover: #1a1a1a;
-    --text-primary: #fff;
-    --text-secondary: #ddd;
-    /* Was #586069 in both schemes: 3.3:1 on black, under the 4.5 a text token
-       needs. Lightened for dark only; #586069 stays as the light colour. */
-    --text-tertiary: #9aa4ad;
-    --text-accent: #3191ff;
-    --svg-primary: #fff;
-    --svg-secondary: #fff;
-    --svg-tertiary: #ffffff99;
-    --border-primary: #ffffff40;
-    --border-secondary: #ced4da; /*Unchanged in both color schemes*/
   }
 }
