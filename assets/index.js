@@ -1,3 +1,57 @@
+// Theme bootstrap. index.js is loaded synchronously from <head>, so this runs
+// before the first paint and the page never flashes the wrong theme.
+const THEME_KEY = "dufs-theme";
+const THEME_CYCLE = ["system", "light", "dark"];
+const THEME_LABELS = { system: "System", light: "Light", dark: "Dark" };
+
+/**
+ * @returns {"system"|"light"|"dark"}
+ */
+function loadTheme() {
+  try {
+    const theme = localStorage.getItem(THEME_KEY);
+    return theme === "light" || theme === "dark" ? theme : "system";
+  } catch {
+    // storage blocked: follow the OS
+    return "system";
+  }
+}
+
+/**
+ * "system" removes the override so the CSS follows prefers-color-scheme.
+ * @param {"system"|"light"|"dark"} theme
+ */
+function applyTheme(theme) {
+  if (theme === "system") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", theme);
+  }
+}
+
+/**
+ * @param {"system"|"light"|"dark"} theme
+ */
+function saveTheme(theme) {
+  try {
+    if (theme === "system") {
+      localStorage.removeItem(THEME_KEY);
+    } else {
+      localStorage.setItem(THEME_KEY, theme);
+    }
+  } catch { }
+}
+
+/**
+ * @param {"system"|"light"|"dark"} theme
+ * @returns {"system"|"light"|"dark"}
+ */
+function nextTheme(theme) {
+  return THEME_CYCLE[(THEME_CYCLE.indexOf(theme) + 1) % THEME_CYCLE.length];
+}
+
+applyTheme(loadTheme());
+
 /**
  * @typedef {object} PathItem
  * @property {"Dir"|"SymlinkDir"|"File"|"SymlinkFile"} path_type
@@ -247,6 +301,8 @@ async function ready() {
   $saveStatus = document.querySelector(".save-status");
 
   window.addEventListener('beforeunload', beforeUnloadHandler);
+
+  setupThemeToggle();
 
   addBreadcrumb(DATA.href, DATA.uri_prefix);
 
@@ -1131,6 +1187,26 @@ function setupDropzone() {
       addFileEntries(items.map(item => item.webkitGetAsEntry()).filter(entry => entry), []);
     }
   });
+}
+
+function setupThemeToggle() {
+  const $themeBtn = document.querySelector(".theme-btn");
+  const render = () => {
+    const theme = loadTheme();
+    const label = `Theme: ${THEME_LABELS[theme]}. Switch to ${THEME_LABELS[nextTheme(theme)]}.`;
+    $themeBtn.setAttribute("aria-label", label);
+    $themeBtn.setAttribute("title", label);
+    for (const name of THEME_CYCLE) {
+      $themeBtn.querySelector(`.theme-icon-${name}`).classList.toggle("hidden", name !== theme);
+    }
+  };
+  $themeBtn.addEventListener("click", () => {
+    const next = nextTheme(loadTheme());
+    saveTheme(next);
+    applyTheme(next);
+    render();
+  });
+  render();
 }
 
 async function setupAuth() {

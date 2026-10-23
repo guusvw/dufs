@@ -22,6 +22,42 @@ fn assets(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn theme_bootstrap_runs_before_first_paint(server: TestServer) -> Result<(), Error> {
+    let ver = env!("CARGO_PKG_VERSION");
+    let text = reqwest::blocking::get(server.url())?.text()?;
+    // index.js must be a blocking script in <head> so data-theme is set
+    // before the body is painted; the toggle lives in toolbox-right.
+    let head = &text[..text.find("</head>").expect("head end")];
+    let script = format!(r#"<script src="/__dufs_v{ver}__/index.js"></script>"#);
+    assert!(head.contains(&script));
+    assert!(!text.contains("<script>"));
+    let right = &text[text
+        .find(r#"class="toolbox-right""#)
+        .expect("toolbox-right")..];
+    assert!(right.contains(r#"class="theme-btn""#));
+
+    let js = reqwest::blocking::get(format!("{}__dufs_v{ver}__/index.js", server.url()))?.text()?;
+    assert!(js.starts_with("// Theme bootstrap"));
+    assert!(js.contains(r#""dufs-theme""#));
+    Ok(())
+}
+
+#[rstest]
+fn theme_tokens_defined_once(server: TestServer) -> Result<(), Error> {
+    let css = reqwest::blocking::get(format!(
+        "{}__dufs_v{}__/index.css",
+        server.url(),
+        env!("CARGO_PKG_VERSION")
+    ))?
+    .text()?;
+    assert_eq!(css.matches("--bg-primary:").count(), 1);
+    assert!(css.contains(r#":root[data-theme="light"]"#));
+    assert!(css.contains(r#":root[data-theme="dark"]"#));
+    assert!(!css.contains("prefers-color-scheme"));
+    Ok(())
+}
+
+#[rstest]
 fn asset_js(server: TestServer) -> Result<(), Error> {
     let url = format!(
         "{}__dufs_v{}__/index.js",
