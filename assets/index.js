@@ -25,7 +25,7 @@
  * @property {string} editable
  */
 
-var DUFS_MAX_UPLOADINGS = 1;
+var DUFS_MAX_UPLOADINGS = 3;
 
 /**
  * @type {DATA} DATA
@@ -104,6 +104,25 @@ const DOWNLOAD_GAP_MS = 300;
 const DOWNLOAD_CONFIRM_ABOVE = 10;
 // A delete confirmation lists this many names, then "and N more".
 const CONFIRM_LIST_MAX = 10;
+/**
+ * Create a text-free icon button for a row action.
+ * @param {string} className
+ * @param {string} glyph
+ * @param {string} title
+ * @param {string} label accessible name, naming the entry
+ * @param {() => void} onClick
+ * @returns {HTMLButtonElement}
+ */
+function actionButton(className, glyph, title, label, onClick) {
+  const $button = document.createElement("button");
+  $button.type = "button";
+  $button.className = className;
+  $button.setAttribute("aria-label", label);
+  $button.setAttribute("title", title);
+  $button.textContent = glyph;
+  $button.addEventListener("click", onClick);
+  return $button;
+}
 
 /**
  * @type Element
@@ -176,10 +195,14 @@ let editorSavedValue = "";
  * Whether Tab inserts a tab character instead of moving focus.
  */
 let editorTabTrap = true;
+/**
+ * @type Element
+ */
+let $cancelAllBtn;
 
 // manage unload event to prevent leaving with uploads in progress or unsaved edits
 const beforeUnloadHandler = (event) => {
-  if (Uploader.queues.length > 0 || Uploader.runnings > 0 || isEditorDirty()) {
+  if (Uploader.busy() || isEditorDirty()) {
     event.preventDefault();
     event.returnValue = '';
     return ''; // for some browsers
@@ -217,6 +240,8 @@ async function ready() {
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
+  $cancelAllBtn = document.querySelector(".cancel-all-btn");
+  $cancelAllBtn.addEventListener("click", () => Uploader.cancelAll());
   $userName = document.querySelector(".user-name");
   $saveStatus = document.querySelector(".save-status");
 
@@ -278,6 +303,16 @@ class Uploader {
     this.currentSpeed = 0;
     this.uploadOffset = 0;
     this.lastUptime = 0;
+    // queued -> running -> done | failed | cancelled; a failed or cancelled
+    // row can be queued again by Retry
+    this.state = "idle";
+    // whether a request was ever sent: only then can Retry resume from the
+    // bytes the server already has
+    this.attempted = false;
+    /**
+     * @type XMLHttpRequest
+     */
+    this.xhr = null;
     this.name = [...pathParts, file.name].join("/");
     this.idx = Uploader.globalIdx++;
     this.file = file;
@@ -312,7 +347,6 @@ class Uploader {
     this.$speed = document.getElementById(`uploadSpeed${idx}`);
     this.$eta = document.getElementById(`uploadEta${idx}`);
     this.$name = document.querySelector(`#upload${idx} .cell-name a`);
-    this.setStatus("-", "Queued");
     this.$percent.textContent = formatPercent(0);
     this.$size.textContent = formatUploadSize(0, this.file.size);
   }
@@ -350,8 +384,69 @@ class Uploader {
 
   upload() {
     this.render();
+    this.enqueue();
+  }
+
+  /**
+   * Queue the upload; it starts as soon as a transfer slot is free.
+   */
+  enqueue() {
+    this.state = "queued";
+    this.setStatus("-", "Queued", this.cancelButton());
     Uploader.queues.push(this);
-    Uploader.runQueue();
+    Uploader.sync();
+  }
+
+  /**
+   * Cancel button for the status cell. The button is replaced by the new
+   * status, so keyboard focus moves to the file name to stay in the row.
+   */
+  cancelButton() {
+    return actionButton("cancel-btn", "✕", "Cancel", `Cancel upload ${this.name}`, () => {
+      this.$name.focus();
+      this.cancel();
+    });
+  }
+
+  retryButton() {
+    return actionButton("retry-btn", "↻", "Retry", `Retry upload ${this.name}`, () => {
+      this.$name.focus();
+      this.enqueue();
+    });
+  }
+
+  /**
+   * Cancel a queued or running upload. A running request is aborted; the
+   * server discards the partial file, so the client sends nothing else.
+   */
+  cancel() {
+    if (this.state === "queued") {
+      Uploader.queues.splice(Uploader.queues.indexOf(this), 1);
+    } else if (this.state === "running") {
+      Uploader.running.delete(this);
+    } else {
+      return;
+    }
+    const xhr = this.xhr;
+    this.state = "cancelled";
+    this.xhr = null;
+    // abort() fires the abort event synchronously; fail() ignores it because
+    // the state is no longer "running"
+    if (xhr) xhr.abort();
+    this.setStatus("⊘", "Cancelled", this.retryButton());
+    this.$speed.textContent = "";
+    this.$eta.textContent = "";
+    announce(`Cancelled ${this.name}`);
+    Uploader.sync();
+  }
+
+  /**
+   * Called by the queue when a transfer slot was granted.
+   */
+  begin() {
+    this.state = "running";
+    Uploader.running.add(this);
+    this.setStatus("↑", "Uploading", this.cancelButton());
   }
 
   /**
@@ -370,15 +465,16 @@ class Uploader {
   ajax() {
     const { url } = this;
 
+    this.attempted = true;
     this.startTime = Date.now();
     this.lastUptime = this.startTime;
     this.speedRecords = 1;
     this.speedAmounts = [0];
     this.speedTimes = [0];
     this.currentSpeed = 0;
-    this.setStatus("↑", "Uploading");
 
     const ajax = new XMLHttpRequest();
+    this.xhr = ajax;
     ajax.upload.addEventListener("progress", e => this.progress(e), false);
     ajax.addEventListener("readystatechange", () => {
       if (ajax.readyState === 4) {
@@ -409,23 +505,31 @@ class Uploader {
     } else {
       ajax.open("PUT", url);
       ajax.send(this.file);
-      // setTimeout(() => ajax.abort(), 3000);
     }
   }
 
-  async retry() {
-    const { url } = this;
-    this.setStatus("↑", "Uploading");
-    let res = await fetch(url, {
-      method: "HEAD",
-    });
-    let uploadOffset = 0;
-    if (res.status == 200) {
-      let value = res.headers.get("content-length");
-      uploadOffset = parseInt(value) || 0;
+  /**
+   * Send the request. After an earlier attempt the server is asked how much
+   * of the file it already has, and only the rest is sent.
+   */
+  async start() {
+    this.uploadOffset = 0;
+    if (this.attempted) {
+      try {
+        const res = await fetch(this.url, {
+          method: "HEAD",
+        });
+        if (res.status == 200) {
+          this.uploadOffset = parseInt(res.headers.get("content-length")) || 0;
+        }
+      } catch {
+        this.fail("network error");
+        return;
+      }
+      // cancelled while the server was being asked
+      if (this.state !== "running") return;
     }
-    this.uploadOffset = uploadOffset;
-    Uploader.runnings++;
+
     this.ajax();
   }
 
@@ -465,44 +569,46 @@ class Uploader {
   }
 
   complete() {
+    if (this.state !== "running") return;
+    this.state = "done";
+    this.xhr = null;
     this.setStatus("✓", "Done");
     this.$percent.textContent = formatPercent(100);
     this.$size.textContent = formatUploadSize(this.file.size, this.file.size);
     this.$speed.textContent = "";
     this.$eta.textContent = "";
     announce(`Uploaded ${this.name}`);
-    Uploader.runnings--;
-    Uploader.runQueue();
+    Uploader.running.delete(this);
+    Uploader.sync();
   }
 
   /**
    * @param {string} reason
    */
   fail(reason) {
-    const $retry = document.createElement("button");
-    $retry.type = "button";
-    $retry.className = "retry-btn";
-    $retry.setAttribute("aria-label", `Retry upload ${this.name}`);
-    $retry.setAttribute("title", "Retry");
-    $retry.textContent = "↻";
-    $retry.addEventListener("click", () => {
-      // the button is replaced by the status, so keep keyboard focus in the row
-      this.$name.focus();
-      this.retry();
-    });
-    this.setFailed(reason, $retry);
+    if (this.state !== "running") return;
+    this.state = "failed";
+    this.xhr = null;
+    this.setFailed(reason, this.retryButton());
     this.$speed.textContent = "";
     this.$eta.textContent = "";
-    Uploader.runnings--;
-    Uploader.runQueue();
+    Uploader.running.delete(this);
+    Uploader.sync();
   }
 }
 
 Uploader.globalIdx = 0;
 
-Uploader.runnings = 0;
+/**
+ * Uploads holding a transfer slot, from slot grant until they settle.
+ * @type Set<Uploader>
+ */
+Uploader.running = new Set();
 
-Uploader.auth = false;
+/**
+ * @type Promise<void>
+ */
+Uploader.authCheck = null;
 
 /**
  * @type Uploader[]
@@ -510,25 +616,54 @@ Uploader.auth = false;
 Uploader.queues = [];
 
 
+/**
+ * Whether anything is queued or running.
+ */
+Uploader.busy = () => Uploader.queues.length > 0 || Uploader.running.size > 0;
+
+/**
+ * Refresh the Cancel all control and fill a free transfer slot.
+ */
+Uploader.sync = () => {
+  $cancelAllBtn.classList.toggle("hidden", !Uploader.busy());
+  Uploader.runQueue();
+};
+
+/**
+ * Check the credentials once, before the first upload, so parallel uploads
+ * do not each trigger a login.
+ */
+Uploader.authenticate = () => {
+  if (!Uploader.authCheck) {
+    Uploader.authCheck = checkAuth().catch(() => {
+      Uploader.authCheck = null;
+    });
+  }
+  return Uploader.authCheck;
+};
+
+Uploader.cancelAll = () => {
+  // queued rows first: cancelling a running one frees a slot, which must not
+  // start a row that is about to be cancelled
+  const pending = [...Uploader.queues, ...Uploader.running];
+  for (const uploader of pending) uploader.cancel();
+  if (pending.length > 0) pending[0].$name.focus();
+};
+
 Uploader.runQueue = async () => {
-  if (Uploader.runnings >= DUFS_MAX_UPLOADINGS) return;
-  if (Uploader.queues.length == 0) {
+  if (Uploader.running.size >= DUFS_MAX_UPLOADINGS) return;
+  const uploader = Uploader.queues.shift();
+  if (!uploader) {
     // Nothing is running or waiting: the queue has drained.
-    if (Uploader.runnings === 0) refreshListing();
+    if (Uploader.running.size === 0) refreshListing();
     return;
   }
-  Uploader.runnings++;
-  let uploader = Uploader.queues.shift();
-  if (!Uploader.auth) {
-    Uploader.auth = true;
-    try {
-      await checkAuth();
-    } catch {
-      Uploader.auth = false;
-    }
-  }
-  uploader.ajax();
-}
+  uploader.begin();
+  await Uploader.authenticate();
+  // cancelled while the credentials were being checked
+  if (uploader.state !== "running") return;
+  await uploader.start();
+};
 
 /**
  * Add breadcrumb
