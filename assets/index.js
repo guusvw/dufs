@@ -1939,16 +1939,17 @@ async function bulkMove(entries) {
     try {
       if (to === from) throw new Error("it is already there");
       if (entryIsDir(file) && to.startsWith(`${from}/`)) throw new Error("a folder cannot move into itself");
-      const head = await fetch(toUrl(to), { method: "HEAD" });
-      if (head.status === 200) throw new Error("the target already exists");
+      // Overwrite: F makes the server refuse (412) instead of replacing an
+      // entry that appeared since the listing was fetched.
       const res = await fetch(newUrl(file.name), {
         method: "MOVE",
-        headers: { "Destination": toUrl(to) },
+        headers: { "Destination": toUrl(to), "Overwrite": "F" },
       });
       await assertResOK(res);
       moved.add(file.name);
     } catch (err) {
-      failures.push(`${file.name} (${moveBlockedReason(err) || err.message})`);
+      const reason = err.code === "destination-exists" ? "the target already exists" : moveBlockedReason(err) || codeReason(err.code) || err.message;
+      failures.push(`${file.name} (${reason})`);
     }
   }
   forgetEntries(moved);
