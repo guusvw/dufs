@@ -1111,8 +1111,9 @@ function formatDirSize(size) {
 }
 
 function formatFileSize(size, unit) {
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.max(0, unit ? sizes.indexOf(unit) : (size > 0 ? parseInt(Math.floor(Math.log(size) / Math.log(1024))) : 0));
+  const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  const last = sizes.length - 1;
+  const i = unit ? Math.max(0, sizes.indexOf(unit)) : (size > 0 ? Math.min(last, Math.max(0, Math.floor(Math.log(size) / Math.log(1024)))) : 0);
   const raw = size > 0 ? size / Math.pow(1024, i) : 0;
   if (i === 0) return [Math.round(raw), "B"];
   return [raw.toFixed(1), sizes[i]];
