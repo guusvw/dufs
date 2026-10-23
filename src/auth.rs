@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 const REALM: &str = "DUFS";
@@ -42,6 +43,10 @@ lazy_static! {
     /// time at which the entry can be dropped. Digest replay protection relies
     /// on this table: a nonce may be used many times (with increasing counts),
     /// but the same count must never be accepted twice.
+    /// Password used for the dummy verification of unknown users when no
+    /// configured user has a sha512-crypt hash. Random per process, so a
+    /// client cannot compute credentials that satisfy it.
+    static ref DUMMY_PASSWORD: String = Uuid::new_v4().to_string();
     static ref NONCE_COUNTS: Mutex<HashMap<(String, String), (u32, u64)>> =
         Mutex::new(HashMap::new());
 }
@@ -50,6 +55,9 @@ lazy_static! {
 pub struct AccessControl {
     empty: bool,
     use_hashed_password: bool,
+    /// First configured `$6$` hash. Unknown users are verified against it so
+    /// that they cost as much as a wrong password for a hashed user.
+    dummy_hash: Option<String>,
     users: IndexMap<String, (String, AccessPaths)>,
     anonymous: Option<AccessPaths>,
 }
@@ -59,6 +67,7 @@ impl Default for AccessControl {
         AccessControl {
             empty: true,
             use_hashed_password: false,
+            dummy_hash: None,
             users: IndexMap::new(),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
         }
@@ -71,7 +80,7 @@ impl AccessControl {
             return Ok(Self::default());
         }
         let new_raw_rules = split_rules(raw_rules);
-        let mut use_hashed_password = false;
+        let mut dummy_hash = None;
         let mut annoy_paths = None;
         let mut account_paths_pairs = vec![];
         for rule in &new_raw_rules {
@@ -112,15 +121,16 @@ impl AccessControl {
                     AccessPerm::IndexOnly,
                 );
             }
-            if pass.starts_with("$6$") {
-                use_hashed_password = true;
+            if pass.starts_with("$6$") && dummy_hash.is_none() {
+                dummy_hash = Some(pass.to_string());
             }
             users.insert(user.to_string(), (pass.to_string(), access_paths));
         }
 
         Ok(Self {
             empty: false,
-            use_hashed_password,
+            use_hashed_password: dummy_hash.is_some(),
+            dummy_hash,
             users,
             anonymous,
         })
@@ -128,6 +138,13 @@ impl AccessControl {
 
     pub fn has_users(&self) -> bool {
         !self.users.is_empty()
+    }
+
+    /// Password to verify against when the client names a user that does not
+    /// exist: a configured `$6$` hash if there is one, so the dummy check
+    /// pays for sha512-crypt like a real one, otherwise a random string.
+    fn dummy_pass(&self) -> &str {
+        self.dummy_hash.as_deref().unwrap_or(&DUMMY_PASSWORD)
     }
 
     /// Returns the guarded `(user, access_paths, via_token, stale)`. `via_token`
@@ -174,27 +191,38 @@ impl AccessControl {
 
         if let Some(authorization) = authorization {
             if let Some(user) = get_auth_user(authorization) {
-                if let Some((pass, ap)) = self.users.get(&user) {
-                    match check_auth(authorization, method.as_str(), request_target, &user, pass) {
-                        AuthResult::Valid => {
-                            if method == Method::OPTIONS {
-                                return (
-                                    Some(user),
-                                    Some(AccessPaths::new(AccessPerm::ReadOnly)),
-                                    false,
-                                    false,
-                                );
-                            }
+                let Some((pass, ap)) = self.users.get(&user) else {
+                    // Do the work of a real check so the response time does
+                    // not reveal which usernames exist. The result is
+                    // discarded: the password is never one a client knows.
+                    let _ = check_auth(
+                        authorization,
+                        method.as_str(),
+                        request_target,
+                        &user,
+                        self.dummy_pass(),
+                    );
+                    return (None, None, false, false);
+                };
+                match check_auth(authorization, method.as_str(), request_target, &user, pass) {
+                    AuthResult::Valid => {
+                        if method == Method::OPTIONS {
                             return (
                                 Some(user),
-                                ap.guard(path, method, Some(root)).await,
+                                Some(AccessPaths::new(AccessPerm::ReadOnly)),
                                 false,
                                 false,
                             );
                         }
-                        AuthResult::Stale => return (None, None, false, true),
-                        AuthResult::Invalid => {}
+                        return (
+                            Some(user),
+                            ap.guard(path, method, Some(root)).await,
+                            false,
+                            false,
+                        );
                     }
+                    AuthResult::Stale => return (None, None, false, true),
+                    AuthResult::Invalid => {}
                 }
             }
 
@@ -655,6 +683,13 @@ pub enum AuthResult {
     Invalid,
 }
 
+/// Compare secrets without leaking, through timing, where they differ or how
+/// long the expected one is. Both sides are hashed to a fixed length first,
+/// because `ConstantTimeEq` on slices of different lengths returns early.
+fn secure_eq(a: &[u8], b: &[u8]) -> bool {
+    Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
+}
+
 pub fn check_auth(
     authorization: &HeaderValue,
     method: &str,
@@ -684,7 +719,7 @@ pub fn check_auth(
             {
                 return AuthResult::Valid;
             }
-        } else if pass == auth_pass {
+        } else if secure_eq(pass.as_bytes(), auth_pass.as_bytes()) {
             return AuthResult::Valid;
         }
 
@@ -765,7 +800,7 @@ fn check_digest_auth(
     c.consume(&*ha);
     let correct_response = format!("{:x}", c.finalize());
 
-    if correct_response.as_bytes() != *user_response {
+    if !secure_eq(correct_response.as_bytes(), user_response) {
         return Some(AuthResult::Invalid);
     }
 
@@ -1468,6 +1503,130 @@ mod tests {
             check_auth(&forged, "GET", "/file.txt", user, "pass"),
             AuthResult::Invalid
         );
+    }
+
+    const HASHED: &str = "$6$gQxZwKyWn/ZmWEA2$4uV7KKMnSUnET2BtWTj/9T5.Jq3h/MdkOlnIl5hdlTxDZ4MZKmJ.kl6C.NL9xnNPqC4lVHC1vuI0E5cLpTJX81";
+
+    fn basic_authorization(user: &str, pass: &str) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "Basic {}",
+            STANDARD.encode(format!("{user}:{pass}"))
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_secure_eq() {
+        assert!(secure_eq(b"", b""));
+        assert!(secure_eq(b"pass", b"pass"));
+        assert!(!secure_eq(b"pass", b"pasS"));
+        assert!(!secure_eq(b"pass", b"pas"));
+        assert!(!secure_eq(b"pas", b"pass"));
+        assert!(!secure_eq(b"pass", b""));
+    }
+
+    #[test]
+    fn test_basic_compares_plain_password() {
+        let auth = basic_authorization("user", "pass");
+        assert_eq!(
+            check_auth(&auth, "GET", "/", "user", "pass"),
+            AuthResult::Valid
+        );
+        for wrong in ["pas", "passs", "Pass", "other"] {
+            assert_eq!(
+                check_auth(&auth, "GET", "/", "user", wrong),
+                AuthResult::Invalid,
+                "{wrong}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_basic_verifies_hashed_password() {
+        let auth = basic_authorization("user", "pass");
+        assert_eq!(
+            check_auth(&auth, "GET", "/", "user", HASHED),
+            AuthResult::Valid
+        );
+        let wrong = basic_authorization("user", "pass2");
+        assert_eq!(
+            check_auth(&wrong, "GET", "/", "user", HASHED),
+            AuthResult::Invalid
+        );
+    }
+
+    #[test]
+    fn test_digest_compares_response() {
+        let user = "cmp-user";
+        let nonce = nonce_with_offset(10);
+        let auth = digest_authorization(user, "pass", &nonce, "/file.txt", "00000001");
+        let text = auth.to_str().unwrap();
+        let start = text.find("response=\"").unwrap() + "response=\"".len();
+        let end = start + text[start..].find('"').unwrap();
+        let response = &text[start..end];
+
+        let altered = |response: String| {
+            HeaderValue::from_str(&format!("{}{response}{}", &text[..start], &text[end..])).unwrap()
+        };
+        // truncated, extended and last-character-flipped responses
+        let mut flipped = response.to_string();
+        let last = flipped.pop().unwrap();
+        flipped.push(if last == '0' { '1' } else { '0' });
+        for wrong in [
+            response[..response.len() - 1].to_string(),
+            format!("{response}0"),
+            flipped,
+        ] {
+            assert_eq!(
+                check_auth(&altered(wrong), "GET", "/file.txt", user, "pass"),
+                AuthResult::Invalid
+            );
+        }
+        assert_eq!(
+            check_auth(
+                &altered(response.to_string()),
+                "GET",
+                "/file.txt",
+                user,
+                "pass"
+            ),
+            AuthResult::Valid
+        );
+    }
+
+    #[test]
+    fn test_dummy_pass_matches_configured_hash() {
+        let plain = AccessControl::new(&["user:pass@/:rw"]).unwrap();
+        assert_eq!(plain.dummy_pass(), DUMMY_PASSWORD.as_str());
+        assert!(!plain.dummy_pass().starts_with("$6$"));
+
+        let rule = format!("user:{HASHED}@/:rw");
+        let hashed = AccessControl::new(&["other:pass@/:rw", &rule]).unwrap();
+        assert_eq!(hashed.dummy_pass(), HASHED);
+    }
+
+    #[tokio::test]
+    async fn test_guard_unknown_user_is_denied() {
+        let rule = format!("user:{HASHED}@/:rw");
+        for rules in [vec!["user:pass@/:rw"], vec![rule.as_str()]] {
+            let ac = AccessControl::new(&rules).unwrap();
+            let root = Path::new(".");
+            // The unknown user sends the real user's password; it must still
+            // be rejected, as must the dummy password's own value.
+            for pass in ["pass", ac.dummy_pass()] {
+                let auth = basic_authorization("nobody", pass);
+                let (user, ap, _, stale) = ac
+                    .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                    .await;
+                assert!(user.is_none() && ap.is_none() && !stale);
+            }
+            let nonce = nonce_with_offset(10);
+            let auth = digest_authorization("nobody", ac.dummy_pass(), &nonce, "/", "00000001");
+            let (user, ap, _, stale) = ac
+                .guard("/", &Method::GET, "/", Some(&auth), None, false, root)
+                .await;
+            assert!(user.is_none() && ap.is_none() && !stale);
+        }
     }
 
     #[test]
