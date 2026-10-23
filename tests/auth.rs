@@ -325,6 +325,42 @@ fn auth_webdav_copy(
 }
 
 #[rstest]
+fn auth_webdav_move_digest_allowed(
+    #[with(&["--auth", "user:pass@/:rw", "--auth", "user3:pass3@/dir1:rw", "-A"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}dir1/test.html", server.url());
+    let new_url = format!("{}dir1/test2.html", server.url());
+    let resp = send_with_digest_auth(
+        fetch!(b"MOVE", &origin_url).header("Destination", &new_url),
+        "user3",
+        "pass3",
+    )?;
+    assert_eq!(resp.status(), 204);
+    let resp = send_with_digest_auth(fetch!(b"GET", &new_url), "user3", "pass3")?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn auth_webdav_copy_digest_allowed(
+    #[with(&["--auth", "user:pass@/:rw", "--auth", "user3:pass3@/dir1:rw", "-A"])]
+    server: TestServer,
+) -> Result<(), Error> {
+    let origin_url = format!("{}dir1/test.html", server.url());
+    let new_url = format!("{}dir1/test2.html", server.url());
+    let resp = send_with_digest_auth(
+        fetch!(b"COPY", &origin_url).header("Destination", &new_url),
+        "user3",
+        "pass3",
+    )?;
+    assert_eq!(resp.status(), 204);
+    let resp = send_with_digest_auth(fetch!(b"GET", &new_url), "user3", "pass3")?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
 fn auth_path_prefix(
     #[with(&["--auth", "user:pass@/:rw", "--path-prefix", "xyz", "-A"])] server: TestServer,
 ) -> Result<(), Error> {

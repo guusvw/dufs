@@ -21,10 +21,12 @@ const REALM: &str = "DUFS";
 /// How long a Digest nonce is accepted. Expired nonces are answered with
 /// `stale=true` so clients can retry transparently with a fresh nonce.
 const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60; // 1 hour
-/// Upper bound on the number of tracked `(nonce, user)` replay counters. Only
-/// authenticated clients can add entries, and expired entries are pruned, but
-/// the cap keeps a long-running server's memory use predictable.
-const MAX_NONCE_COUNTS: usize = 10_000;
+/// Upper bound on the number of tracked `(nonce, nc)` replay counters per
+/// user. Only authenticated clients can add entries, and expired entries are
+/// pruned, but the cap keeps a long-running server's memory use predictable.
+/// The bound is per user so one account can never disturb the replay state of
+/// another.
+const MAX_NONCE_COUNTS_PER_USER: usize = 10_000;
 const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
 /// Upper bound on the depth of an auth rule path. The permission tree is built
 /// and traversed recursively, so an absurdly deep rule would otherwise risk a
@@ -38,12 +40,29 @@ lazy_static! {
         h.consume(std::process::id().to_be_bytes());
         h
     };
-    /// Highest `nc` seen for each `(nonce, user)` pair, together with the unix
-    /// time at which the entry can be dropped. Digest replay protection relies
-    /// on this table: a nonce may be used many times (with increasing counts),
-    /// but the same count must never be accepted twice.
-    static ref NONCE_COUNTS: Mutex<HashMap<(String, String), (u32, u64)>> =
-        Mutex::new(HashMap::new());
+    /// Replay state for Digest nonces, per user. Digest replay protection
+    /// relies on this table: a nonce may be used many times (with increasing
+    /// counts), but the same count must never be accepted twice.
+    static ref NONCE_COUNTS: Mutex<HashMap<String, UserNonces>> = Mutex::new(HashMap::new());
+}
+
+/// Replay state of a single user's Digest nonces.
+#[derive(Default)]
+struct UserNonces {
+    counts: HashMap<String, NonceEntry>,
+    /// Nonces minted at or before this unix time that are not in `counts` were
+    /// either evicted or never used. They are rejected, because an evicted
+    /// nonce could otherwise be replayed with a count that was already used.
+    evicted_before: Option<u32>,
+}
+
+struct NonceEntry {
+    /// Highest `nc` seen.
+    count: u32,
+    /// Unix time at which the entry can be dropped.
+    expires: u64,
+    /// Unix time the nonce was minted at.
+    minted: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +147,28 @@ impl AccessControl {
 
     pub fn has_users(&self) -> bool {
         !self.users.is_empty()
+    }
+
+    /// Resolve the access of an already authenticated identity, without
+    /// authenticating again. `user` is the user returned by [`Self::guard`]
+    /// (`None` for anonymous access). Used for secondary paths of a request,
+    /// such as the destination of `COPY`/`MOVE`, because Digest credentials
+    /// are single-use and cannot be verified twice.
+    pub async fn guard_authenticated(
+        &self,
+        user: Option<&str>,
+        path: &str,
+        method: &Method,
+        root: &Path,
+    ) -> Option<AccessPaths> {
+        if self.empty {
+            return Some(AccessPaths::new(AccessPerm::ReadWrite));
+        }
+        let ap = match user {
+            Some(user) => self.users.get(user).map(|(_, ap)| ap),
+            None => self.anonymous.as_ref(),
+        };
+        ap?.guard(path, method, Some(root)).await
     }
 
     /// Returns the guarded `(user, access_paths, via_token, stale)`. `via_token`
@@ -788,7 +829,8 @@ fn check_digest_auth(
 /// were already used. Digest `nc` is an 8-digit hexadecimal counter that must
 /// strictly increase for a given nonce; seeing the same value twice means the
 /// Authorization header was replayed (RFC 7616 §3.2.2). Returns `false` for
-/// malformed or replayed counts.
+/// malformed or replayed counts, and for nonces that are no longer tracked
+/// because the user's table overflowed.
 fn record_nonce_count(nonce: &str, user: &str, nc: &[u8]) -> bool {
     if nc.len() != 8 || !nc.iter().all(u8::is_ascii_hexdigit) {
         return false;
@@ -799,30 +841,71 @@ fn record_nonce_count(nonce: &str, user: &str, nc: &[u8]) -> bool {
     let Ok(nc) = u32::from_str_radix(nc, 16) else {
         return false;
     };
+    let Some(minted) = nonce
+        .get(..NONCE_TIME_LEN)
+        .and_then(|v| u32::from_str_radix(v, 16).ok())
+    else {
+        return false;
+    };
 
     let now = unix_now().as_secs();
-    let expires = now.saturating_add(DIGEST_AUTH_TIMEOUT as u64);
     let mut nonce_counts = NONCE_COUNTS.lock().unwrap();
-    if nonce_counts.len() >= MAX_NONCE_COUNTS {
-        nonce_counts.retain(|_, (_, expires)| *expires > now);
-        // `retain` cannot make room if every tracked nonce is still fresh;
-        // dropping all state is preferable to unbounded memory growth.
-        if nonce_counts.len() >= MAX_NONCE_COUNTS {
-            nonce_counts.clear();
-        }
-    }
-    let key = (nonce.to_string(), user.to_string());
-    match nonce_counts.get_mut(&key) {
-        Some((count, _)) => {
-            if nc <= *count {
+    nonce_counts
+        .entry(user.to_string())
+        .or_default()
+        .record(nonce, minted, nc, now)
+}
+
+impl UserNonces {
+    fn record(&mut self, nonce: &str, minted: u32, nc: u32, now: u64) -> bool {
+        if let Some(entry) = self.counts.get_mut(nonce) {
+            if nc <= entry.count {
                 return false;
             }
-            *count = nc;
-            true
+            entry.count = nc;
+            return true;
         }
-        None => {
-            nonce_counts.insert(key, (nc, expires));
-            true
+
+        if self.counts.len() >= MAX_NONCE_COUNTS_PER_USER {
+            self.counts.retain(|_, entry| entry.expires > now);
+            if self.counts.len() >= MAX_NONCE_COUNTS_PER_USER {
+                self.evict_oldest();
+            }
+        }
+        // An untracked nonce minted before the newest evicted one may have
+        // been evicted, in which case its used counts are forgotten.
+        if self.evicted_before.is_some_and(|evicted| minted <= evicted) {
+            return false;
+        }
+
+        let expires = now.saturating_add(DIGEST_AUTH_TIMEOUT as u64);
+        self.counts.insert(
+            nonce.to_string(),
+            NonceEntry {
+                count: nc,
+                expires,
+                minted,
+            },
+        );
+        true
+    }
+
+    /// Drop the oldest tenth of the entries (at least one) and remember how far
+    /// back the evicted nonces reach. Evicting in batches keeps the cost of a
+    /// full table amortised.
+    fn evict_oldest(&mut self) {
+        let evict = (MAX_NONCE_COUNTS_PER_USER / 10).max(1);
+        let mut order: Vec<(u32, String)> = self
+            .counts
+            .iter()
+            .map(|(nonce, entry)| (entry.minted, nonce.clone()))
+            .collect();
+        order.sort_unstable();
+        for (_, nonce) in &order[..evict.min(order.len())] {
+            self.counts.remove(nonce);
+        }
+        if let Some((minted, _)) = order.get(evict - 1) {
+            self.evicted_before = Some(self.evicted_before.map_or(*minted, |v| v.max(*minted)));
         }
     }
 }
@@ -1311,16 +1394,20 @@ mod tests {
         assert_ne!(nonce, create_nonce().unwrap());
     }
 
-    /// Mint a valid nonce whose timestamp is `offset` seconds in the past.
-    /// Tests use distinct offsets so they do not share replay state.
-    fn nonce_with_offset(offset: u32) -> String {
-        let secs = (unix_now().as_secs() as u32).saturating_sub(offset);
-        let random = offset as u64 + 1;
+    /// Mint a valid nonce minted at unix time `secs` with the given randomness.
+    fn nonce_at(secs: u32, random: u64) -> String {
         let mut h = NONCESTARTHASH.clone();
         h.consume(secs.to_be_bytes());
         h.consume(random.to_be_bytes());
         let n = format!("{:08x}{:016x}{:032x}", secs, random, h.finalize());
         n[..NONCE_LEN].to_string()
+    }
+
+    /// Mint a valid nonce whose timestamp is `offset` seconds in the past.
+    /// Tests use distinct offsets so they do not share replay state.
+    fn nonce_with_offset(offset: u32) -> String {
+        let secs = (unix_now().as_secs() as u32).saturating_sub(offset);
+        nonce_at(secs, offset as u64 + 1)
     }
 
     fn digest_authorization(
@@ -1432,6 +1519,67 @@ mod tests {
         );
         assert_eq!(
             check_auth(&bob, "GET", "/file.txt", "bob", "pass"),
+            AuthResult::Valid
+        );
+    }
+
+    #[test]
+    fn test_digest_nonce_flood_does_not_reset_other_users() {
+        let now = unix_now().as_secs() as u32;
+        let uri = "/file.txt";
+
+        let bob_nonce = nonce_with_offset(50);
+        let bob = digest_authorization("flood-bob", "pass", &bob_nonce, uri, "00000001");
+        assert_eq!(
+            check_auth(&bob, "GET", uri, "flood-bob", "pass"),
+            AuthResult::Valid
+        );
+
+        // Alice uses more nonces than the table holds, each minted a little
+        // later than the previous one.
+        let base = now - 2600;
+        let mut first = None;
+        for i in 0..=MAX_NONCE_COUNTS_PER_USER as u64 {
+            let nonce = nonce_at(base + (i / 4) as u32, i + 1000);
+            let auth = digest_authorization("flood-alice", "pass", &nonce, uri, "00000001");
+            assert_eq!(
+                check_auth(&auth, "GET", uri, "flood-alice", "pass"),
+                AuthResult::Valid,
+                "nonce {i}"
+            );
+            first.get_or_insert(auth);
+        }
+
+        // Bob's replay state survived Alice's flood.
+        assert_eq!(
+            check_auth(&bob, "GET", uri, "flood-bob", "pass"),
+            AuthResult::Invalid
+        );
+        // Alice's oldest nonce was evicted. Replaying it must still fail.
+        assert_eq!(
+            check_auth(&first.unwrap(), "GET", uri, "flood-alice", "pass"),
+            AuthResult::Invalid
+        );
+        // The newest nonce is still tracked and still protected.
+        let last = nonce_at(
+            base + (MAX_NONCE_COUNTS_PER_USER / 4) as u32,
+            1000 + MAX_NONCE_COUNTS_PER_USER as u64,
+        );
+        let last = digest_authorization("flood-alice", "pass", &last, uri, "00000001");
+        assert_eq!(
+            check_auth(&last, "GET", uri, "flood-alice", "pass"),
+            AuthResult::Invalid
+        );
+        // Unused newer nonces keep working.
+        let fresh = digest_authorization(
+            "flood-alice",
+            "pass",
+            &nonce_with_offset(51),
+            uri,
+            "00000001",
+        );
+        assert_eq!(
+            check_auth(&fresh, "GET", uri, "flood-alice", "pass"),
             AuthResult::Valid
         );
     }
