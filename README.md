@@ -77,6 +77,8 @@ Options:
       --log-format <format>  Customize http log format
       --log-file <file>      Specify the file to save logs to, other than stdout/stderr
       --compress <level>     Set zip compress level [default: low] [possible values: none, low, medium, high]
+      --shutdown-timeout <seconds>
+                             Seconds to wait for in-flight requests on SIGINT/SIGTERM before aborting them [default: 10]
       --token-secret-file <path>  Path to the secret that signs share tokens, created if missing
       --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
       --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
@@ -232,6 +234,8 @@ Health checks
 ```sh
 curl http://127.0.0.1:5000/__dufs__/health
 ```
+
+On SIGINT/SIGTERM dufs stops accepting connections and waits up to `--shutdown-timeout` seconds for in-flight requests before aborting them. While draining, the health check answers `503`.
 
 <details>
 <summary><h2>Advanced Topics</h2></summary>
@@ -392,6 +396,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --log-format <format>   DUFS_LOG_FORMAT=""
     --log-file <file>       DUFS_LOG_FILE=./dufs.log
     --compress <compress>   DUFS_COMPRESS=low
+    --shutdown-timeout <seconds>  DUFS_SHUTDOWN_TIMEOUT=10
     --tls-cert <path>       DUFS_TLS_CERT=cert.pem
     --tls-key <path>        DUFS_TLS_KEY=key.pem
     --token-secret-file <path>  DUFS_TOKEN_SECRET_FILE=token.secret
@@ -432,6 +437,7 @@ assets: ./assets/
 log-format: '$remote_addr "$request" $status $http_user_agent'
 log-file: ./dufs.log
 compress: low
+shutdown-timeout: 10
 tls-cert: tests/data/cert.pem
 tls-key: tests/data/key_pkcs1.pem
 token-secret-file: token.secret
