@@ -496,6 +496,48 @@ svg {
     min-height: 44px;
   }
 
+  /* Upload progress is a card too: name and size on top, status underneath. */
+  .uploaders-table {
+    width: 100%;
+  }
+
+  .uploaders-table thead {
+    display: none;
+  }
+
+  .uploaders-table .uploader {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "icon name size"
+      "icon status status";
+    align-items: start;
+    padding: 0.35em 0;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .uploaders-table .uploader>.cell-icon {
+    grid-area: icon;
+    padding-top: 0.2em;
+  }
+
+  .uploaders-table .uploader>.cell-name {
+    grid-area: name;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .uploaders-table .uploader>.cell-size {
+    grid-area: size;
+    white-space: nowrap;
+    padding-left: 0.5em;
+  }
+
+  .uploaders-table .uploader>.cell-status {
+    grid-area: status;
+    padding: 0.1em 0 0;
+  }
+
   .uploaders-table .cell-percent,
   .uploaders-table .cell-speed,
   .uploaders-table .cell-eta {
