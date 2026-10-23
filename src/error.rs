@@ -37,6 +37,8 @@ pub enum DufsErrorCode {
     // 412
     PreconditionFailed,
     DestinationExists,
+    // 503
+    Busy,
 }
 
 impl DufsErrorCode {
@@ -61,6 +63,7 @@ impl DufsErrorCode {
             MethodNotAllowed => "method-not-allowed",
             PreconditionFailed => "precondition-failed",
             DestinationExists => "destination-exists",
+            Busy => "busy",
         }
     }
 
@@ -77,6 +80,7 @@ impl DufsErrorCode {
                 StatusCode::METHOD_NOT_ALLOWED
             }
             PreconditionFailed | DestinationExists => StatusCode::PRECONDITION_FAILED,
+            Busy => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -98,6 +102,7 @@ impl DufsErrorCode {
             ArchiveDisabled => "Not Found",
             MissingUploadOffset => "",
             AlreadyExists => "Already exists",
+            Busy => "Server busy, retry later",
             MethodNotAllowed | PreconditionFailed | DestinationExists => "",
         }
     }
@@ -126,7 +131,7 @@ mod tests {
     #[test]
     fn codes_are_unique() {
         use DufsErrorCode::*;
-        const ALL: [DufsErrorCode; 17] = [
+        const ALL: [DufsErrorCode; 18] = [
             InvalidPath,
             InvalidUploadOffset,
             InvalidDepth,
@@ -144,6 +149,7 @@ mod tests {
             MethodNotAllowed,
             PreconditionFailed,
             DestinationExists,
+            Busy,
         ];
         let mut codes = std::collections::HashSet::new();
         for code in ALL {

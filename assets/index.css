@@ -143,6 +143,12 @@ svg {
   font-style: italic;
 }
 
+.search-note {
+  font-style: italic;
+  padding: 0.5em 0;
+  color: var(--text-secondary);
+}
+
 .uploaders-table th,
 .paths-table th {
   text-align: left;

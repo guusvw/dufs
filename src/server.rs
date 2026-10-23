@@ -26,7 +26,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+        CONTENT_TYPE, RANGE, RETRY_AFTER,
     },
     Method, StatusCode, Uri,
 };
@@ -39,10 +39,11 @@ use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::{fs, io};
 
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -63,6 +64,10 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+/// Capacity of the channel streaming walked paths to their consumer.
+const WALK_CHANNEL_SIZE: usize = 256;
+/// Requests allowed to wait for a free walk slot before new ones get a 503.
+const MAX_QUEUED_WALKS: usize = 128;
 
 pub struct Server {
     args: Args,
@@ -70,6 +75,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    walk_limiter: WalkLimiter,
 }
 
 impl Server {
@@ -98,6 +104,7 @@ impl Server {
         Ok(Self {
             args,
             running,
+            walk_limiter: WalkLimiter::new(),
             single_file_req_paths,
             assets_prefix,
             html,
@@ -644,6 +651,7 @@ impl Server {
         self.send_index(
             path,
             paths,
+            false,
             exist,
             query_params,
             head_only,
@@ -663,6 +671,7 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let mut paths: Vec<PathItem> = vec![];
+        let mut truncated = false;
         let search = query_params
             .get("q")
             .ok_or_else(|| anyhow!("invalid q"))?
@@ -674,25 +683,33 @@ impl Server {
         }
 
         if !head_only {
-            let path_buf = path.to_path_buf();
-            let hidden = Arc::new(self.args.hidden.to_vec());
-            let search = search.clone();
+            let Some(permit) = self.walk_limiter.acquire().await else {
+                respond_busy(res);
+                return Ok(());
+            };
             let prefix = self.relative_parts(path);
+            let limit = self.args.search_limit;
 
-            let search_paths = tokio::spawn(collect_dir_entries(
-                access_paths.clone(),
-                self.running.clone(),
-                path_buf,
-                hidden,
-                self.args.allow_symlink,
-                self.args.serve_path.clone(),
+            let mut search_paths = start_walk(
+                permit,
+                WalkSpec {
+                    dirs: access_paths.entry_paths(path),
+                    hidden: self.args.hidden.clone(),
+                    follow_symlinks: self.args.allow_symlink,
+                    serve_path: self.args.serve_path.clone(),
+                    running: self.running.clone(),
+                },
                 move |x| get_file_name(x.path()).to_lowercase().contains(&search),
-            ))
-            .await?;
+            );
 
-            for search_path in search_paths.into_iter() {
+            // Dropping the receiver on return stops the walker.
+            while let Some(search_path) = search_paths.recv().await {
                 if let Ok(Some(mut item)) = self.to_pathitem(search_path, path.to_path_buf()).await
                 {
+                    if paths.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
                     let access = access_paths
                         .entry_access(&item.name, &prefix, Some(&self.args.serve_path))
                         .await;
@@ -704,6 +721,7 @@ impl Server {
         self.send_index(
             path,
             paths,
+            truncated,
             true,
             query_params,
             head_only,
@@ -720,14 +738,25 @@ impl Server {
         access_paths: AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
-        let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
         let filename = try_get_file_name(path)?;
+        let permit = if head_only {
+            None
+        } else {
+            match self.walk_limiter.acquire().await {
+                Some(permit) => Some(permit),
+                None => {
+                    respond_busy(res);
+                    return Ok(());
+                }
+            }
+        };
         set_content_disposition(res, false, &format!("{filename}.zip"))?;
         res.headers_mut()
             .insert("content-type", HeaderValue::from_static("application/zip"));
-        if head_only {
+        let Some(permit) = permit else {
             return Ok(());
-        }
+        };
+        let (mut writer, reader) = tokio::io::duplex(BUF_SIZE);
         let path = path.to_owned();
         let hidden = self.args.hidden.clone();
         let running = self.running.clone();
@@ -739,11 +768,12 @@ impl Server {
                 &mut writer,
                 &path,
                 access_paths,
-                &hidden,
+                hidden,
                 compression,
                 follow_symlinks,
                 serve_path,
                 running,
+                permit,
             )
             .await
             {
@@ -908,7 +938,7 @@ impl Server {
                             return Ok(true);
                         }
                     };
-                    if path.exists() {
+                    if fs::metadata(&path).await.is_ok() {
                         self.handle_send_file(&path, headers, head_only, res)
                             .await?;
                     } else {
@@ -1413,6 +1443,7 @@ impl Server {
         &self,
         path: &Path,
         mut paths: Vec<PathItem>,
+        truncated: bool,
         exist: bool,
         query_params: &HashMap<String, String>,
         head_only: bool,
@@ -1480,6 +1511,7 @@ impl Server {
             auth: self.args.auth.has_users(),
             user,
             paths,
+            truncated,
         };
         let output = if has_query_flag(query_params, "json") {
             res.headers_mut()
@@ -1783,6 +1815,8 @@ pub struct IndexData {
     pub auth: bool,
     pub user: Option<String>,
     pub paths: Vec<PathItem>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -1976,20 +2010,24 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     writer: &mut W,
     dir: &Path,
     access_paths: AccessPaths,
-    hidden: &[String],
+    hidden: Vec<String>,
     compression: CompressionLevel,
     follow_symlinks: bool,
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
+    permit: OwnedSemaphorePermit,
 ) -> Result<()> {
-    let hidden = Arc::new(hidden.to_vec());
-    let zip_paths = tokio::task::spawn(collect_dir_entries(
-        access_paths,
-        running,
-        dir.to_path_buf(),
-        hidden,
-        follow_symlinks,
-        serve_path,
+    // Entries are zipped while the walk is still going, so the first bytes
+    // reach the client without waiting for the whole tree to be scanned.
+    let mut zip_paths = start_walk(
+        permit,
+        WalkSpec {
+            dirs: access_paths.entry_paths(dir),
+            hidden,
+            follow_symlinks,
+            serve_path,
+            running,
+        },
         move |x| {
             // Include both files and directories. Symbolic links are already
             // resolved by `follow_links`, so `file_type` reports the target's
@@ -1999,10 +2037,10 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
                 file_type.is_file() || file_type.is_dir()
             }
         },
-    ))
-    .await?;
+    );
     let mut zip = ZipWriter::new(&mut *writer).with_compression_level(compression);
-    for zip_path in zip_paths.into_iter() {
+    // Returning early drops the receiver, which stops the walk.
+    while let Some(zip_path) = zip_paths.recv().await {
         let filename = match zip_path
             .strip_prefix(dir)
             .ok()
@@ -2161,25 +2199,93 @@ fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
         .unwrap_or_default()
 }
 
-async fn collect_dir_entries<F>(
-    access_paths: AccessPaths,
-    running: Arc<AtomicBool>,
-    path: PathBuf,
-    hidden: Arc<Vec<String>>,
+/// What a directory walk visits and which entries it skips.
+struct WalkSpec {
+    dirs: Vec<PathBuf>,
+    hidden: Vec<String>,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    running: Arc<AtomicBool>,
+}
+
+/// Bounds the number of concurrent directory walks, so that searches and
+/// archives cannot starve the blocking thread pool.
+struct WalkLimiter {
+    slots: Arc<Semaphore>,
+    queued: AtomicUsize,
+}
+
+struct QueueGuard<'a>(&'a AtomicUsize);
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, atomic::Ordering::SeqCst);
+    }
+}
+
+impl WalkLimiter {
+    fn new() -> Self {
+        let slots = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1);
+        Self {
+            slots: Arc::new(Semaphore::new(slots)),
+            queued: AtomicUsize::new(0),
+        }
+    }
+
+    /// Wait for a free walk slot. Returns `None` when too many requests are
+    /// already waiting.
+    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        if self.queued.fetch_add(1, atomic::Ordering::SeqCst) >= MAX_QUEUED_WALKS {
+            self.queued.fetch_sub(1, atomic::Ordering::SeqCst);
+            return None;
+        }
+        let _queued = QueueGuard(&self.queued);
+        self.slots.clone().acquire_owned().await.ok()
+    }
+}
+
+fn respond_busy(res: &mut Response) {
+    DufsErrorCode::Busy.respond(res);
+    res.headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("5"));
+}
+
+/// Walk the directories on a blocking thread and stream the accepted paths to
+/// the returned receiver. The walk stops once the receiver is dropped; the
+/// permit is held until then.
+fn start_walk<F>(
+    permit: OwnedSemaphorePermit,
+    spec: WalkSpec,
     include_entry: F,
-) -> Vec<PathBuf>
+) -> mpsc::Receiver<PathBuf>
+where
+    F: Fn(&DirEntry) -> bool + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(WALK_CHANNEL_SIZE);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        walk_dir_entries(&spec, &tx, include_entry);
+    });
+    rx
+}
+
+fn walk_dir_entries<F>(spec: &WalkSpec, tx: &mpsc::Sender<PathBuf>, include_entry: F)
 where
     F: Fn(&DirEntry) -> bool,
 {
-    let mut paths: Vec<PathBuf> = vec![];
-    for dir in access_paths.entry_paths(&path) {
-        let mut it = WalkDir::new(&dir).follow_links(true).into_iter();
+    for dir in &spec.dirs {
+        let mut it = WalkDir::new(dir).follow_links(true).into_iter();
         it.next();
         while let Some(entry) = it.next() {
-            if !running.load(atomic::Ordering::SeqCst) {
-                break;
+            // Checked on every entry, not only on a send, so that a walk
+            // without matches also stops once the client is gone.
+            if tx.is_closed() || !spec.running.load(atomic::Ordering::SeqCst) {
+                return;
             }
             let entry = match entry {
                 Ok(v) => v,
@@ -2188,18 +2294,17 @@ where
             let entry_path = entry.path();
             let base_name = get_file_name(entry_path);
             let is_dir = entry.file_type().is_dir();
-            if is_hidden(&hidden, base_name, is_dir) {
+            if is_hidden(&spec.hidden, base_name, is_dir) {
                 if is_dir {
                     it.skip_current_dir();
                 }
                 continue;
             }
 
-            if !follow_symlinks
-                && !fs::canonicalize(entry_path)
-                    .await
+            if !spec.follow_symlinks
+                && !std::fs::canonicalize(entry_path)
                     .ok()
-                    .map(|v| v.starts_with(&serve_path))
+                    .map(|v| v.starts_with(&spec.serve_path))
                     .unwrap_or_default()
             {
                 // We walked outside the server's root. This could only have
@@ -2213,8 +2318,38 @@ where
             if !include_entry(&entry) {
                 continue;
             }
-            paths.push(entry_path.to_path_buf());
+            if tx.blocking_send(entry_path.to_path_buf()).is_err() {
+                return;
+            }
         }
     }
-    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn walk_limiter_rejects_past_queue_bound() {
+        let limiter = Arc::new(WalkLimiter {
+            slots: Arc::new(Semaphore::new(1)),
+            queued: AtomicUsize::new(0),
+        });
+        let permit = limiter.acquire().await.unwrap();
+        let waiters: Vec<_> = (0..MAX_QUEUED_WALKS)
+            .map(|_| {
+                let limiter = limiter.clone();
+                tokio::spawn(async move { limiter.acquire().await.is_some() })
+            })
+            .collect();
+        while limiter.queued.load(atomic::Ordering::SeqCst) < MAX_QUEUED_WALKS {
+            tokio::task::yield_now().await;
+        }
+        assert!(limiter.acquire().await.is_none());
+        drop(permit);
+        for waiter in waiters {
+            assert!(waiter.await.unwrap());
+        }
+        assert_eq!(limiter.queued.load(atomic::Ordering::SeqCst), 0);
+    }
 }

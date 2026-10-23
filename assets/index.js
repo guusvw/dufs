@@ -23,6 +23,7 @@
  * @property {string} user
  * @property {boolean} dir_exists
  * @property {string} editable
+ * @property {boolean} [truncated]
  */
 
 var DUFS_MAX_UPLOADINGS = 1;
@@ -529,6 +530,13 @@ function renderPathsTableBody() {
       DATA.allow_delete || DATA.paths.some((p) => p?.allow_delete);
     for (let i = 0; i < len; i++) {
       addPath(DATA.paths[i], i, showMove, showDelete);
+    }
+    if (DATA.truncated) {
+      const $note = document.createElement("div");
+      $note.className = "search-note";
+      $note.setAttribute("role", "status");
+      $note.textContent = `Showing first ${len} results`;
+      $pathsTable.after($note);
     }
   } else {
     $emptyFolder.textContent = DIR_EMPTY_NOTE;

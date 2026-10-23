@@ -48,6 +48,12 @@ pub fn generate_noscript_html(data: &IndexData) -> Result<String> {
 
     html.push_str("  </tbody>\n");
     html.push_str("</table>\n");
+    if data.truncated {
+        html.push_str(&format!(
+            "<p>Showing first {} results</p>\n",
+            data.paths.len()
+        ));
+    }
     html.push_str("</body>\n");
 
     Ok(html)
