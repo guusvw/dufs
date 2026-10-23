@@ -18,6 +18,7 @@ pub enum DufsErrorCode {
     // 400
     InvalidPath,
     InvalidUploadOffset,
+    InvalidUploadId,
     InvalidDepth,
     InvalidDestination,
     // 403
@@ -30,10 +31,14 @@ pub enum DufsErrorCode {
     InternalError,
     // 404
     ArchiveDisabled,
+    UploadNotFound,
     // 405
     MissingUploadOffset,
     AlreadyExists,
     MethodNotAllowed,
+    // 409
+    UploadIdInUse,
+    UploadOffsetMismatch,
     // 412
     PreconditionFailed,
     DestinationExists,
@@ -46,6 +51,7 @@ impl DufsErrorCode {
         match self {
             InvalidPath => "invalid-path",
             InvalidUploadOffset => "invalid-upload-offset",
+            InvalidUploadId => "invalid-upload-id",
             InvalidDepth => "invalid-depth",
             InvalidDestination => "invalid-destination",
             Forbidden => "forbidden",
@@ -56,9 +62,12 @@ impl DufsErrorCode {
             IsADirectory => "is-a-directory",
             InternalError => "internal-error",
             ArchiveDisabled => "archive-disabled",
+            UploadNotFound => "upload-not-found",
             MissingUploadOffset => "missing-upload-offset",
             AlreadyExists => "already-exists",
             MethodNotAllowed => "method-not-allowed",
+            UploadIdInUse => "upload-id-in-use",
+            UploadOffsetMismatch => "upload-offset-mismatch",
             PreconditionFailed => "precondition-failed",
             DestinationExists => "destination-exists",
         }
@@ -67,15 +76,15 @@ impl DufsErrorCode {
     pub const fn status(self) -> StatusCode {
         use DufsErrorCode::*;
         match self {
-            InvalidPath | InvalidUploadOffset | InvalidDepth | InvalidDestination => {
-                StatusCode::BAD_REQUEST
-            }
+            InvalidPath | InvalidUploadOffset | InvalidUploadId | InvalidDepth
+            | InvalidDestination => StatusCode::BAD_REQUEST,
             Forbidden | ReadonlyDescendant | UploadDisabled | DeleteDisabled | HashDisabled
             | IsADirectory | InternalError => StatusCode::FORBIDDEN,
-            ArchiveDisabled => StatusCode::NOT_FOUND,
+            ArchiveDisabled | UploadNotFound => StatusCode::NOT_FOUND,
             MissingUploadOffset | AlreadyExists | MethodNotAllowed => {
                 StatusCode::METHOD_NOT_ALLOWED
             }
+            UploadIdInUse | UploadOffsetMismatch => StatusCode::CONFLICT,
             PreconditionFailed | DestinationExists => StatusCode::PRECONDITION_FAILED,
         }
     }
@@ -86,6 +95,7 @@ impl DufsErrorCode {
         match self {
             InvalidPath => "Invalid Path",
             InvalidUploadOffset => "Invalid X-Update-Range Header",
+            InvalidUploadId => "Invalid upload id",
             InvalidDepth => "Invalid depth: only 0 and 1 are allowed.",
             InvalidDestination => "Invalid Destination",
             Forbidden => "Forbidden",
@@ -96,6 +106,9 @@ impl DufsErrorCode {
             IsADirectory => "Forbidden: target is a directory",
             InternalError => "Forbidden: failed to access the directory",
             ArchiveDisabled => "Not Found",
+            UploadNotFound => "Upload not found",
+            UploadIdInUse => "Upload id is in use",
+            UploadOffsetMismatch => "Upload offset does not match the received length",
             MissingUploadOffset => "",
             AlreadyExists => "Already exists",
             MethodNotAllowed | PreconditionFailed | DestinationExists => "",
@@ -126,9 +139,10 @@ mod tests {
     #[test]
     fn codes_are_unique() {
         use DufsErrorCode::*;
-        const ALL: [DufsErrorCode; 17] = [
+        const ALL: [DufsErrorCode; 21] = [
             InvalidPath,
             InvalidUploadOffset,
+            InvalidUploadId,
             InvalidDepth,
             InvalidDestination,
             Forbidden,
@@ -139,6 +153,9 @@ mod tests {
             IsADirectory,
             InternalError,
             ArchiveDisabled,
+            UploadNotFound,
+            UploadIdInUse,
+            UploadOffsetMismatch,
             MissingUploadOffset,
             AlreadyExists,
             MethodNotAllowed,

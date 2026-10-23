@@ -207,6 +207,8 @@ class Uploader {
     this.speedTimes = [];
     this.currentSpeed = 0;
     this.uploadOffset = 0;
+    this.resume = false;
+    this.uploadId = newUploadId();
     this.lastUptime = 0;
     this.name = [...pathParts, file.name].join("/");
     this.idx = Uploader.globalIdx++;
@@ -255,8 +257,6 @@ class Uploader {
   }
 
   ajax() {
-    const { url } = this;
-
     this.startTime = Date.now();
     this.lastUptime = this.startTime;
     this.speedRecords = 1;
@@ -289,29 +289,43 @@ class Uploader {
     })
     ajax.addEventListener("error", () => this.fail(), false);
     ajax.addEventListener("abort", () => this.fail(), false);
-    if (this.uploadOffset > 0) {
-      ajax.open("PATCH", url);
-      ajax.setRequestHeader("X-Update-Range", "append");
+    const uploadUrl = this.uploadUrl();
+    if (this.resume) {
+      ajax.open("PATCH", uploadUrl);
+      ajax.setRequestHeader("X-Update-Range", `bytes=${this.uploadOffset}-`);
       ajax.send(this.file.slice(this.uploadOffset));
     } else {
-      ajax.open("PUT", url);
+      ajax.open("PUT", uploadUrl);
       ajax.send(this.file);
       // setTimeout(() => ajax.abort(), 3000);
     }
   }
 
   async retry() {
-    const { url } = this;
-    let res = await fetch(url, {
-      method: "HEAD",
-    });
+    // Only an upload this uploader started can be continued, and only through
+    // its id. Anything else, such as a file that already exists under this
+    // name, is not ours to append to: start over with a full PUT instead.
+    Uploader.runnings++;
+    let resume = false;
     let uploadOffset = 0;
-    if (res.status == 200) {
-      let value = res.headers.get("content-length");
-      uploadOffset = parseInt(value) || 0;
+    try {
+      const res = await fetch(this.uploadUrl(), { method: "HEAD" });
+      if (res.status == 200) {
+        resume = true;
+        uploadOffset = parseInt(res.headers.get("x-dufs-upload-offset")) || 0;
+      }
+    } catch {
+      this.fail();
+      return;
     }
+    if (!resume) this.uploadId = newUploadId();
+    this.resume = resume;
     this.uploadOffset = uploadOffset;
     this.ajax();
+  }
+
+  uploadUrl() {
+    return `${this.url}?upload=${this.uploadId}`;
   }
 
   progress(event) {
@@ -1035,6 +1049,15 @@ function newUrl(name) {
   if (!url.endsWith("/")) url += "/";
   url += name.split("/").map(encodeURIComponent).join("/");
   return url;
+}
+
+/**
+ * Random id naming an upload on the server, which keeps the bytes of an
+ * interrupted upload under it so that the upload can be resumed.
+ */
+function newUploadId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
 function baseUrl() {

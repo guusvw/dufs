@@ -441,7 +441,9 @@ fn get_file_content_type(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
-fn resumable_upload(#[with(&["--allow-upload"])] server: TestServer) -> Result<(), Error> {
+fn resumable_upload(
+    #[with(&["--allow-upload", "--allow-delete"])] server: TestServer,
+) -> Result<(), Error> {
     let url = format!("{}file1", server.url());
     let resp = fetch!(b"PUT", &url).body(b"abc".to_vec()).send()?;
     assert_eq!(resp.status(), 201);

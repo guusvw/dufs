@@ -34,13 +34,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::{fs, io};
@@ -62,6 +62,8 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const PART_FILE_INFIX: &str = ".dufs-";
 const PART_FILE_SUFFIX: &str = ".part";
+const UPLOAD_ID_HEADER: &str = "x-dufs-upload-id";
+const UPLOAD_OFFSET_HEADER: &str = "x-dufs-upload-offset";
 const PART_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PART_FILE_NAME_MAX_LEN: usize = 200;
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
@@ -73,6 +75,8 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    /// Part files that a request is currently writing.
+    active_uploads: Mutex<HashSet<PathBuf>>,
 }
 
 impl Server {
@@ -104,6 +108,7 @@ impl Server {
             single_file_req_paths,
             assets_prefix,
             html,
+            active_uploads: Mutex::new(HashSet::new()),
         })
     }
 
@@ -303,8 +308,20 @@ impl Server {
             return Ok(res);
         }
 
+        let upload_id = query_params.get("upload").map(String::as_str);
+        if matches!(method, Method::HEAD | Method::PUT | Method::PATCH)
+            && upload_id.is_some_and(|v| !is_upload_id(v))
+        {
+            DufsErrorCode::InvalidUploadId.respond(&mut res);
+            return Ok(res);
+        }
+
         match method {
             Method::GET | Method::HEAD => {
+                if let (true, Some(id)) = (head_only, upload_id) {
+                    self.handle_upload_status(path, id, &mut res).await;
+                    return Ok(res);
+                }
                 if is_dir {
                     if render_try_index {
                         if allow_archive && has_query_flag(&query_params, "zip") {
@@ -441,14 +458,30 @@ impl Server {
                 } else if !allow_delete && size > 0 {
                     DufsErrorCode::DeleteDisabled.respond(&mut res);
                 } else {
-                    self.handle_upload(path, None, size, req, &mut res).await?;
+                    self.handle_upload(path, None, upload_id, size, req, &mut res)
+                        .await?;
                 }
             }
             Method::PATCH => {
-                if is_miss {
+                if let Some(id) = upload_id {
+                    // The upload completes by replacing the target, so it
+                    // needs the same permissions as a PUT.
+                    if is_dir {
+                        DufsErrorCode::IsADirectory.respond(&mut res);
+                    } else if !allow_upload {
+                        DufsErrorCode::UploadDisabled.respond(&mut res);
+                    } else if !allow_delete && size > 0 {
+                        DufsErrorCode::DeleteDisabled.respond(&mut res);
+                    } else {
+                        self.handle_resume_upload(path, id, req, &mut res).await?;
+                    }
+                } else if is_miss {
                     status_not_found(&mut res);
                 } else if !allow_upload {
                     DufsErrorCode::UploadDisabled.respond(&mut res);
+                } else if !allow_delete && size > 0 {
+                    // Changing an existing file is overwriting it.
+                    DufsErrorCode::DeleteDisabled.respond(&mut res);
                 } else {
                     let offset = match parse_upload_offset(headers, size) {
                         Ok(v) => v,
@@ -460,11 +493,7 @@ impl Server {
                     };
                     match offset {
                         Some(offset) => {
-                            if offset < size && !allow_delete {
-                                DufsErrorCode::DeleteDisabled.respond(&mut res);
-                                return Ok(res);
-                            }
-                            self.handle_upload(path, Some(offset), size, req, &mut res)
+                            self.handle_upload(path, Some(offset), None, size, req, &mut res)
                                 .await?;
                         }
                         None => {
@@ -569,6 +598,7 @@ impl Server {
         &self,
         path: &Path,
         upload_offset: Option<u64>,
+        upload_id: Option<&str>,
         size: u64,
         req: Request,
         res: &mut Response,
@@ -579,12 +609,41 @@ impl Server {
         let body_reader = StreamReader::new(body_with_io_error);
         pin_mut!(body_reader);
 
-        let status = match upload_offset {
-            None => {
-                write_atomic(path, &mut body_reader).await?;
+        let status = match (upload_offset, upload_id) {
+            (None, None) => {
+                let target = resolve_write_target(path).await?;
+                let part = part_path(&target, &Uuid::new_v4().simple().to_string())?;
+                let file = create_part_file(&part).await?;
+                let mut guard = PartFileGuard(Some(part.clone()));
+                commit_part_file(file, &part, &target, &mut body_reader).await?;
+                guard.0 = None;
                 StatusCode::CREATED
             }
-            Some(offset) => {
+            (None, Some(id)) => {
+                // The client chose the id so that it can resume after losing
+                // the connection, when no response could carry one. The part
+                // file is therefore kept on failure.
+                let target = resolve_write_target(path).await?;
+                let part = part_path(&target, id)?;
+                let Some(_active) = self.claim_upload(&part) else {
+                    DufsErrorCode::UploadIdInUse.respond(res);
+                    return Ok(());
+                };
+                let file = match create_part_file(&part).await {
+                    Ok(file) => file,
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        DufsErrorCode::UploadIdInUse.respond(res);
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                if let Err(err) = commit_part_file(file, &part, &target, &mut body_reader).await {
+                    respond_upload_failed(res, id, &err);
+                    return Ok(());
+                }
+                StatusCode::CREATED
+            }
+            (Some(offset), _) => {
                 let mut file = if offset == size {
                     fs::OpenOptions::new().append(true).open(path).await?
                 } else {
@@ -600,6 +659,86 @@ impl Server {
         *res.status_mut() = status;
 
         Ok(())
+    }
+
+    /// Continues upload `id` of `path` from the offset in `X-Update-Range`,
+    /// which must be the number of bytes received so far.
+    async fn handle_resume_upload(
+        &self,
+        path: &Path,
+        id: &str,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let offset = match parse_resume_offset(req.headers()) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                DufsErrorCode::MissingUploadOffset.respond(res);
+                return Ok(());
+            }
+            Err(err) => {
+                DufsErrorCode::InvalidUploadOffset.respond_with(res, &err.to_string());
+                return Ok(());
+            }
+        };
+        let target = resolve_write_target(path).await?;
+        let part = part_path(&target, id)?;
+        let Some(_active) = self.claim_upload(&part) else {
+            DufsErrorCode::UploadIdInUse.respond(res);
+            return Ok(());
+        };
+        let received = match fs::metadata(&part).await {
+            Ok(meta) if meta.is_file() => meta.len(),
+            _ => {
+                DufsErrorCode::UploadNotFound.respond(res);
+                return Ok(());
+            }
+        };
+        if received != offset {
+            DufsErrorCode::UploadOffsetMismatch.respond(res);
+            insert_upload_offset(res, received);
+            return Ok(());
+        }
+        let file = fs::OpenOptions::new().append(true).open(&part).await?;
+        let stream = IncomingStream::new(req.into_body());
+        let body_with_io_error = stream.map_err(io::Error::other);
+        let body_reader = StreamReader::new(body_with_io_error);
+        pin_mut!(body_reader);
+        if let Err(err) = commit_part_file(file, &part, &target, &mut body_reader).await {
+            respond_upload_failed(res, id, &err);
+            return Ok(());
+        }
+        status_no_content(res);
+        Ok(())
+    }
+
+    /// Reports how many bytes upload `id` of `path` has received.
+    async fn handle_upload_status(&self, path: &Path, id: &str, res: &mut Response) {
+        if !self.args.allow_upload {
+            DufsErrorCode::UploadDisabled.respond(res);
+            return;
+        }
+        match received_len(path, id).await {
+            Some(received) => {
+                insert_upload_offset(res, received);
+                res.headers_mut()
+                    .typed_insert(CacheControl::new().with_no_cache());
+            }
+            None => DufsErrorCode::UploadNotFound.respond(res),
+        }
+    }
+
+    /// Marks the part file as being written, or returns `None` if another
+    /// request is writing it.
+    fn claim_upload(&self, part: &Path) -> Option<ActiveUpload<'_>> {
+        let mut active = self
+            .active_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        active.insert(part.to_path_buf()).then(|| ActiveUpload {
+            active: &self.active_uploads,
+            part: part.to_path_buf(),
+        })
     }
 
     /// Whether a recursive write on the guarded path would also affect a path
@@ -1949,51 +2088,84 @@ impl Drop for PartFileGuard {
     }
 }
 
-/// Writes `reader` to a temp file next to `path` and renames it over `path`
-/// once complete, so the target is either the old or the new content, never a
-/// partial or mixed one.
-async fn write_atomic<R: AsyncRead + Unpin>(path: &Path, reader: &mut R) -> io::Result<()> {
-    // Write through a symlink, as opening the path directly would.
+/// Releases an upload's part file for other requests once dropped.
+struct ActiveUpload<'a> {
+    active: &'a Mutex<HashSet<PathBuf>>,
+    part: PathBuf,
+}
+
+impl Drop for ActiveUpload<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.part);
+    }
+}
+
+/// The file a write to `path` ends up in. Writing through a symlink, as
+/// opening the path directly would, means replacing the file it points to.
+async fn resolve_write_target(path: &Path) -> io::Result<PathBuf> {
     let is_symlink = fs::symlink_metadata(path)
         .await
         .is_ok_and(|v| v.is_symlink());
-    let target = if is_symlink {
-        fs::canonicalize(path).await?
+    if is_symlink {
+        fs::canonicalize(path).await
     } else {
-        path.to_path_buf()
-    };
-    let part = match (target.parent(), target.file_name()) {
-        (Some(dir), Some(name)) => dir.join(part_file_name(&name.to_string_lossy())),
-        _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
-    };
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&part)
-        .await?;
-    let mut guard = PartFileGuard(Some(part.clone()));
-    io::copy(reader, &mut file).await?;
-    file.flush().await?;
-    file.sync_data().await?;
-    drop(file);
-    if let Ok(meta) = fs::metadata(&target).await {
-        fs::set_permissions(&part, meta.permissions()).await?;
+        Ok(path.to_path_buf())
     }
-    fs::rename(&part, &target).await?;
-    guard.0 = None;
-    Ok(())
 }
 
-fn part_file_name(name: &str) -> String {
+/// The part file of upload `id` for `target`, next to it.
+fn part_path(target: &Path, id: &str) -> io::Result<PathBuf> {
+    match (target.parent(), target.file_name()) {
+        (Some(dir), Some(name)) => Ok(dir.join(part_file_name(&name.to_string_lossy(), id))),
+        _ => Err(io::Error::from(io::ErrorKind::InvalidInput)),
+    }
+}
+
+async fn create_part_file(part: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .await
+}
+
+/// Writes `reader` to the open part file and renames it over `target` once
+/// complete, so the target is either the old or the new content, never a
+/// partial or mixed one. The part file is left in place on failure.
+async fn commit_part_file<R: AsyncRead + Unpin>(
+    mut file: fs::File,
+    part: &Path,
+    target: &Path,
+    reader: &mut R,
+) -> io::Result<()> {
+    let copied = io::copy(reader, &mut file).await;
+    // Whatever arrived must be on disk before the error is reported, as the
+    // part file's length is the offset a client resumes from.
+    file.flush().await?;
+    copied?;
+    file.sync_data().await?;
+    drop(file);
+    if let Ok(meta) = fs::metadata(target).await {
+        fs::set_permissions(part, meta.permissions()).await?;
+    }
+    fs::rename(part, target).await
+}
+
+fn part_file_name(name: &str, id: &str) -> String {
     let mut end = name.len().min(PART_FILE_NAME_MAX_LEN);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
-        ".{}{PART_FILE_INFIX}{}{PART_FILE_SUFFIX}",
-        &name[..end],
-        Uuid::new_v4().simple()
-    )
+    format!(".{}{PART_FILE_INFIX}{id}{PART_FILE_SUFFIX}", &name[..end])
+}
+
+/// Whether `id` is a valid upload id: what a client puts in `?upload=` and
+/// what the part file name ends with.
+fn is_upload_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Whether `name` is the temp file of an in-progress upload.
@@ -2001,11 +2173,19 @@ fn is_part_file(name: &str) -> bool {
     name.strip_prefix('.')
         .and_then(|v| v.strip_suffix(PART_FILE_SUFFIX))
         .and_then(|v| v.rsplit_once(PART_FILE_INFIX))
-        .is_some_and(|(_, id)| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .is_some_and(|(_, id)| is_upload_id(id))
 }
 
 fn has_part_file_component(path: &str) -> bool {
     path.split('/').any(is_part_file)
+}
+
+/// Bytes received so far by upload `id` of `path`, if it exists.
+async fn received_len(path: &Path, id: &str) -> Option<u64> {
+    let target = resolve_write_target(path).await.ok()?;
+    let part = part_path(&target, id).ok()?;
+    let meta = fs::metadata(part).await.ok()?;
+    meta.is_file().then_some(meta.len())
 }
 
 /// Removes upload temp files left behind by a crash or kill, once they are old
@@ -2052,7 +2232,9 @@ fn add_cors(res: &mut Response) {
     );
     res.headers_mut().insert(
         "Access-Control-Expose-Headers",
-        HeaderValue::from_static("Authorization,X-Dufs-Error-Code,*"),
+        HeaderValue::from_static(
+            "Authorization,X-Dufs-Error-Code,X-Dufs-Upload-Id,X-Dufs-Upload-Offset,*",
+        ),
     );
 }
 
@@ -2145,6 +2327,21 @@ fn status_no_content(res: &mut Response) {
     *res.status_mut() = StatusCode::NO_CONTENT;
 }
 
+/// Reports the failure of a resumable upload. The part file is kept, so the
+/// response names the upload to resume.
+fn respond_upload_failed(res: &mut Response, id: &str, err: &io::Error) {
+    warn!("Upload {id} failed: {err}");
+    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    if let Ok(value) = HeaderValue::from_str(id) {
+        res.headers_mut().insert(UPLOAD_ID_HEADER, value);
+    }
+}
+
+fn insert_upload_offset(res: &mut Response, received: u64) {
+    res.headers_mut()
+        .insert(UPLOAD_OFFSET_HEADER, HeaderValue::from(received));
+}
+
 fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
     let kind = if inline { "inline" } else { "attachment" };
     let filename: String = filename
@@ -2230,10 +2427,40 @@ fn parse_upload_offset(headers: &HeaderMap<HeaderValue>, size: u64) -> Result<Op
     if value == "append" {
         return Ok(Some(size));
     }
+    if let Some(start) = parse_open_range_start(value) {
+        // `bytes=<size>-` is the exact end of the file, which `parse_range`
+        // rejects as unsatisfiable.
+        return if start <= size {
+            Ok(Some(start))
+        } else {
+            Err(err())
+        };
+    }
     // use the first range
     let ranges = parse_range(value, size).ok_or_else(err)?;
     let (start, _) = ranges.first().ok_or_else(err)?;
     Ok(Some(*start))
+}
+
+/// Offset a resumed upload continues from, taken from `X-Update-Range:
+/// bytes=<n>-`.
+fn parse_resume_offset(headers: &HeaderMap<HeaderValue>) -> Result<Option<u64>> {
+    let value = match headers.get("x-update-range") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let err = || anyhow!("Invalid X-Update-Range Header");
+    let value = value.to_str().map_err(|_| err())?;
+    parse_open_range_start(value).map(Some).ok_or_else(err)
+}
+
+/// The `<n>` of an open-ended `bytes=<n>-` range.
+fn parse_open_range_start(value: &str) -> Option<u64> {
+    let start = value.strip_prefix("bytes=")?.strip_suffix('-')?;
+    if !start.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    start.parse().ok()
 }
 
 async fn sha256_file(path: &Path) -> Result<String> {
