@@ -926,14 +926,16 @@ function restoreFocus(focus) {
  * goes afterwards; defaults to where it is now
  */
 function renderPathsTableBody(focus = captureFocus()) {
-  const listed = new Set(DATA.paths.map(p => p.name));
+  // Entries that are gone, or hidden by the instant filter, leave the
+  // selection: bulk actions only ever apply to what the page shows.
+  const paths = visiblePaths();
+  const shown = new Set(paths.map(p => p.name));
   for (const name of selection) {
-    if (!listed.has(name)) selection.delete(name);
+    if (!shown.has(name)) selection.delete(name);
   }
   const scrollY = window.scrollY;
   $pathsTableBody.replaceChildren();
   document.querySelector(".search-note")?.remove();
-  const paths = visiblePaths();
   if (paths.length > 0) {
     // Show an action column when it is available for the current directory or
     // at least one entry. Rows without permission render the action disabled.
@@ -1668,7 +1670,7 @@ function setupSelection() {
     if (!e.target.matches(".select-all")) return;
     selection.clear();
     if (e.target.checked) {
-      for (const file of DATA.paths) selection.add(file.name);
+      for (const file of visiblePaths()) selection.add(file.name);
     }
     selectAnchor = null;
     syncSelection();
