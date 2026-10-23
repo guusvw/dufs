@@ -1201,7 +1201,7 @@ function setupDropzone() {
         }
         new Uploader(file, []).upload();
       }
-      if (skippedFolder) alert("Folders cannot be uploaded in this browser");
+      if (skippedFolder) showNotice("Folders cannot be uploaded in this browser");
     } else {
       addFileEntries(items.map(item => item.webkitGetAsEntry()).filter(entry => entry), []);
     }
