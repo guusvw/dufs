@@ -68,9 +68,24 @@ const ICONS = {
 }
 
 /**
- * @type Map<string, Uploader>
+ * Live region announcing finished and failed uploads.
+ * @type Element
  */
-const failUploaders = new Map();
+let $uploadAnnouncer;
+
+/**
+ * Announce a message to screen readers. Each message is its own node, so
+ * several uploads finishing together are all read out, each exactly once.
+ * @param {string} message
+ */
+function announce(message) {
+  const $message = document.createElement("div");
+  $message.textContent = message;
+  $uploadAnnouncer.append($message);
+  while ($uploadAnnouncer.childElementCount > 20) {
+    $uploadAnnouncer.firstElementChild.remove();
+  }
+}
 
 /**
  * @type Element
@@ -144,6 +159,7 @@ async function ready() {
   $pathsTableHead = document.querySelector(".paths-table thead");
   $pathsTableBody = document.querySelector(".paths-table tbody");
   $uploadersTable = document.querySelector(".uploaders-table");
+  $uploadAnnouncer = document.querySelector(".upload-announcer");
   $emptyFolder = document.querySelector(".empty-folder");
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
@@ -241,22 +257,45 @@ class Uploader {
     this.$size = document.getElementById(`uploadSize${idx}`);
     this.$speed = document.getElementById(`uploadSpeed${idx}`);
     this.$eta = document.getElementById(`uploadEta${idx}`);
-    this.$status.textContent = "-";
+    this.$name = document.querySelector(`#upload${idx} .cell-name a`);
+    this.setStatus("-", "Queued");
     this.$percent.textContent = formatPercent(0);
     this.$size.textContent = formatUploadSize(0, this.file.size);
   }
 
+  /**
+   * Show a status glyph with a text alternative: the glyph is hidden from
+   * assistive technology and a visually hidden word is read instead.
+   * @param {string} glyph
+   * @param {string} label
+   * @param {Node[]} extra further nodes shown after the status
+   */
+  setStatus(glyph, label, ...extra) {
+    const $glyph = document.createElement("span");
+    $glyph.setAttribute("aria-hidden", "true");
+    $glyph.setAttribute("title", label);
+    $glyph.textContent = glyph;
+    const $label = document.createElement("span");
+    $label.className = "sr-only";
+    $label.textContent = label;
+    this.$status.replaceChildren($glyph, $label, ...extra);
+  }
+
+  /**
+   * Mark the row failed and show why as visible text.
+   * @param {string} reason
+   * @param {Node[]} extra further nodes shown after the reason
+   */
+  setFailed(reason, ...extra) {
+    const $reason = document.createElement("span");
+    $reason.className = "status-reason";
+    $reason.textContent = reason;
+    this.setStatus("✗", "Failed", $reason, ...extra);
+    announce(`Upload failed: ${this.name}: ${reason}`);
+  }
+
   upload() {
     this.render();
-    this.$status.addEventListener("click", e => {
-      const nodeId = e.target.id;
-      const matches = /^retry(\d+)$/.exec(nodeId);
-      if (matches) {
-        const id = parseInt(matches[1]);
-        let uploader = failUploaders.get(id);
-        if (uploader) uploader.retry();
-      }
-    });
     Uploader.queues.push(this);
     Uploader.runQueue();
   }
@@ -271,11 +310,7 @@ class Uploader {
   static unreadable(name, pathParts, reason) {
     const uploader = new Uploader(new File([], name), pathParts);
     uploader.render();
-    const $reason = document.createElement("span");
-    $reason.setAttribute("title", reason);
-    $reason.textContent = "✗";
-    uploader.$status.replaceChildren($reason);
-    uploader.$size.textContent = reason;
+    uploader.setFailed(reason);
   }
 
   ajax() {
@@ -287,7 +322,7 @@ class Uploader {
     this.speedAmounts = [0];
     this.speedTimes = [0];
     this.currentSpeed = 0;
-    this.$status.textContent = "↑";
+    this.setStatus("↑", "Uploading");
 
     const ajax = new XMLHttpRequest();
     ajax.upload.addEventListener("progress", e => this.progress(e), false);
@@ -311,8 +346,8 @@ class Uploader {
         }
       }
     })
-    ajax.addEventListener("error", () => this.fail(), false);
-    ajax.addEventListener("abort", () => this.fail(), false);
+    ajax.addEventListener("error", () => this.fail("network error"), false);
+    ajax.addEventListener("abort", () => this.fail("upload aborted"), false);
     if (this.uploadOffset > 0) {
       ajax.open("PATCH", url);
       ajax.setRequestHeader("X-Update-Range", "append");
@@ -326,6 +361,7 @@ class Uploader {
 
   async retry() {
     const { url } = this;
+    this.setStatus("↑", "Uploading");
     let res = await fetch(url, {
       method: "HEAD",
     });
@@ -345,7 +381,6 @@ class Uploader {
     this.lastUptime = now;
     const uploadedSize = event.loaded + this.uploadOffset;
     const [speedValue, speedUnit] = formatFileSize(this.currentSpeed);
-    this.$status.textContent = "↑";
     this.$percent.textContent = formatPercent((uploadedSize / this.file.size) * 100);
     this.$size.textContent = formatUploadSize(uploadedSize, this.file.size);
     this.$speed.textContent = `${speedValue} ${speedUnit}/s`;
@@ -375,29 +410,34 @@ class Uploader {
   }
 
   complete() {
-    this.$status.textContent = "✓";
+    this.setStatus("✓", "Done");
     this.$percent.textContent = formatPercent(100);
     this.$size.textContent = formatUploadSize(this.file.size, this.file.size);
     this.$speed.textContent = "";
     this.$eta.textContent = "";
-    failUploaders.delete(this.idx);
+    announce(`Uploaded ${this.name}`);
     Uploader.runnings--;
     Uploader.runQueue();
   }
 
-  fail(reason = "") {
-    const $reason = document.createElement("span");
-    $reason.setAttribute("title", reason);
-    $reason.textContent = "✗";
-    const $retry = document.createElement("span");
+  /**
+   * @param {string} reason
+   */
+  fail(reason) {
+    const $retry = document.createElement("button");
+    $retry.type = "button";
     $retry.className = "retry-btn";
-    $retry.id = `retry${this.idx}`;
+    $retry.setAttribute("aria-label", `Retry upload ${this.name}`);
     $retry.setAttribute("title", "Retry");
     $retry.textContent = "↻";
-    this.$status.replaceChildren($reason, $retry);
+    $retry.addEventListener("click", () => {
+      // the button is replaced by the status, so keep keyboard focus in the row
+      this.$name.focus();
+      this.retry();
+    });
+    this.setFailed(reason, $retry);
     this.$speed.textContent = "";
     this.$eta.textContent = "";
-    failUploaders.set(this.idx, this);
     Uploader.runnings--;
     Uploader.runQueue();
   }
@@ -446,6 +486,7 @@ function addBreadcrumb(href, uri_prefix) {
   }
   const len = parts.length;
   let path = uri_prefix;
+  let items = "";
   for (let i = 0; i < len; i++) {
     const name = parts[i];
     if (i > 0) {
@@ -456,17 +497,18 @@ function addBreadcrumb(href, uri_prefix) {
     }
     const escapedName = escapeHtml(name);
     const escapedPath = escapeHtml(path);
+    const current = i === len - 1 ? ` aria-current="page"` : "";
+    let item;
     if (i === 0) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${escapedPath}" title="Root"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`);
+      item = `<a href="${escapedPath}" title="Root" aria-label="Root"${current}><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`;
     } else if (i === len - 1) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<b>${escapedName}</b>`);
+      item = `<b${current}>${escapedName}</b>`;
     } else {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${escapedPath}">${escapedName}</a>`);
+      item = `<a href="${escapedPath}">${escapedName}</a>`;
     }
-    if (i !== len - 1) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<span class="separator">/</span>`);
-    }
+    items += `<li>${item}</li>`;
   }
+  $breadcrumb.innerHTML = `<ol>${items}</ol>`;
 }
 
 async function setupIndexPage() {

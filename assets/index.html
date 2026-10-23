@@ -13,7 +13,7 @@
 
 <body>
   <div class="head">
-    <div class="breadcrumb"></div>
+    <nav class="breadcrumb" aria-label="Breadcrumb"></nav>
     <div class="toolbox">
       <a href="" class="control download hidden" title="Download file" download="">
         <svg width="16" height="16" viewBox="0 0 16 16">
@@ -130,6 +130,7 @@
       <textarea id="editor" class="editor hidden" aria-label="Editor" cols="10"></textarea>
     </div>
   </div>
+  <div class="upload-announcer sr-only" aria-live="polite"></div>
   <template id="index-data">__INDEX_DATA__</template>
   <script src="__ASSETS_PREFIX__index.js"></script>
 </body>
