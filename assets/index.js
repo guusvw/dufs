@@ -934,7 +934,10 @@ async function setupEditorPage() {
     const url = baseUrl();
     const ext = extName(baseName(url));
     if (IFRAME_FORMATS.find(v => v === ext)) {
-      $notEditable.insertAdjacentHTML("afterend", `<iframe src="${escapeHtml(url)}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
+      // No sandbox attribute: Chromium refuses to render PDFs in a sandboxed
+      // iframe. The server sends `Content-Security-Policy: sandbox` on every
+      // file response, which gives the same isolation and lets PDFs load.
+      $notEditable.insertAdjacentHTML("afterend", `<iframe src="${escapeHtml(url)}" width="100%" height="${window.innerHeight - 100}px"></iframe>`);
     } else {
       $notEditable.classList.remove("hidden");
       $notEditable.textContent = "Cannot edit because file is too large or binary.";
