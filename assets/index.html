@@ -102,6 +102,13 @@
         </svg>
       </button>
     </div>
+    <div class="selection-bar hidden" role="toolbar" aria-label="Actions for the selected entries">
+      <span class="selection-count" role="status"></span>
+      <button type="button" class="bulk-btn" data-bulk="download">Download</button>
+      <button type="button" class="bulk-btn" data-bulk="move">Move</button>
+      <button type="button" class="bulk-btn danger" data-bulk="delete">Delete</button>
+      <button type="button" class="bulk-btn" data-bulk="clear" title="Clear selection (Esc)">Clear</button>
+    </div>
   </div>
   <div class="main">
     <div class="notices" role="alert" aria-atomic="false"></div>
