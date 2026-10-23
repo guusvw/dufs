@@ -6,6 +6,8 @@ use std::{
 
 use chrono::{Local, SecondsFormat};
 
+use hyper::header::HeaderValue;
+
 use crate::{auth::get_auth_user, server::Request, utils::decode_uri};
 
 pub const DEFAULT_LOG_FORMAT: &str =
@@ -38,7 +40,7 @@ impl HttpLogger {
             match element {
                 LogElement::Variable(name) => match name.as_str() {
                     "request" | "request_method" | "request_uri" => {
-                        let uri = req.uri().to_string();
+                        let uri = redact_query(&req.uri().to_string());
                         let decoded_uri = decode_uri(&uri)
                             .map(|s| sanitize_log_value(&s))
                             .unwrap_or_else(|| uri.clone());
@@ -59,8 +61,15 @@ impl HttpLogger {
                     _ => {}
                 },
                 LogElement::Header(name) => {
-                    if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
-                        data.insert(name.to_string(), sanitize_log_value(value));
+                    if let Some(value) = req.headers().get(name) {
+                        let logged = if is_credential_header(name) {
+                            redact_credential(name, value)
+                        } else {
+                            value.to_str().ok().map(sanitize_log_value)
+                        };
+                        if let Some(logged) = logged {
+                            data.insert(name.to_string(), logged);
+                        }
                     }
                 }
                 LogElement::Literal(_) => {}
@@ -170,4 +179,74 @@ fn sanitize_log_value(s: &str) -> String {
             c => vec![c],
         })
         .collect()
+}
+
+const REDACTED: &str = "***";
+
+/// Replace the value of every `token` query parameter so share tokens never
+/// reach the access log. Works on the raw (still percent-encoded) URI so an
+/// encoded `&` inside a value cannot leak the tail of the token.
+fn redact_query(uri: &str) -> String {
+    let Some((path, rest)) = uri.split_once('?') else {
+        return uri.to_string();
+    };
+    let (query, fragment) = match rest.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (rest, None),
+    };
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_token_key(key) => format!("{key}={REDACTED}"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(fragment) => format!("{path}?{query}#{fragment}"),
+        None => format!("{path}?{query}"),
+    }
+}
+
+/// Query keys are matched the way the server parses them (form-urlencoded).
+fn is_token_key(raw_key: &str) -> bool {
+    form_urlencoded::parse(raw_key.as_bytes())
+        .next()
+        .is_some_and(|(key, _)| key == "token")
+}
+
+fn is_credential_header(name: &str) -> bool {
+    ["authorization", "proxy-authorization", "cookie"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Keep only what identifies the kind of credential: the auth scheme (plus the
+/// claimed username for Digest) or the cookie names. Secrets become `***`.
+fn redact_credential(name: &str, value: &HeaderValue) -> Option<String> {
+    let text = value.to_str().ok()?;
+    if name.eq_ignore_ascii_case("cookie") {
+        let cookies = text
+            .split(';')
+            .map(|cookie| {
+                let cookie_name = cookie.split_once('=').map_or(cookie, |(n, _)| n).trim();
+                format!("{}={REDACTED}", sanitize_log_value(cookie_name))
+            })
+            .collect::<Vec<_>>();
+        return Some(cookies.join("; "));
+    }
+    let scheme = text.split_whitespace().next()?;
+    if scheme.eq_ignore_ascii_case("digest") {
+        if let Some(user) = get_auth_user(value) {
+            return Some(format!(
+                "{} username=\"{}\" …{REDACTED}",
+                sanitize_log_value(scheme),
+                sanitize_log_value(&user)
+            ));
+        }
+    }
+    if text.trim() == scheme {
+        return Some(REDACTED.to_string());
+    }
+    Some(format!("{} {REDACTED}", sanitize_log_value(scheme)))
 }

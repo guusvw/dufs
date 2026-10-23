@@ -328,6 +328,8 @@ The log format can use following variables.
 | $status      | response status                                                           |
 | $http_       | arbitrary request header field. examples: $http_user_agent, $http_referer |
 
+Secrets are redacted from the log: the value of the `token` query parameter in `$request` / `$request_uri` is replaced with `***`, and `$http_authorization`, `$http_proxy_authorization` and `$http_cookie` only log the scheme (`Basic ***`, `Digest username="u" …***`) or the cookie names (`sid=***`).
+
 
 The default log format is `'$time_iso8601 $log_level - $remote_addr "$request" $status`.
 ```
