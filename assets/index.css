@@ -407,12 +407,23 @@ button.toolbox-right,
   font-style: italic;
 }
 
-.retry-btn {
+.retry-btn,
+.cancel-btn {
   background: none;
   border: 0;
   color: inherit;
   font: inherit;
   padding: 0 0.4em;
+  cursor: pointer;
+}
+
+.cancel-all-btn {
+  background: none;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  padding: 0.1em 0.8em;
   cursor: pointer;
 }
 
@@ -641,8 +652,24 @@ button.toolbox-right,
     width: 100%;
   }
 
+  /* The header stays so that "Cancel all" is reachable: title on the left,
+     the button on the right. */
   .uploaders-table thead {
+    display: block;
+  }
+
+  .uploaders-table thead tr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .uploaders-table thead th:not(.cell-name):not(.cell-status) {
     display: none;
+  }
+
+  .uploaders-table thead .cell-status {
+    padding: 0;
   }
 
   .uploaders-table .uploader {
@@ -682,7 +709,9 @@ button.toolbox-right,
     overflow-wrap: anywhere;
   }
 
-  .retry-btn {
+  .retry-btn,
+  .cancel-btn,
+  .cancel-all-btn {
     min-width: 44px;
     min-height: 44px;
   }
