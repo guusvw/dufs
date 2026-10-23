@@ -89,14 +89,22 @@ svg {
 }
 
 .toolbox>a,
-.toolbox>div {
+.toolbox>div,
+.toolbox>button {
   /* vertically align with breadcrumb text */
   height: 1.1rem;
 }
 
 .toolbox .control {
   cursor: pointer;
-  padding-left: 0.25em;
+  /* A fixed box per control: the SVG widths differ (12-16px), so padding alone
+     made the gaps between icons look uneven. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.9em;
+  padding: 0 0.15em;
+  box-sizing: border-box;
 }
 
 .upload-file input {
@@ -185,8 +193,23 @@ svg {
   text-decoration: none;
 }
 
+/* The column the list is sorted by, so the state is visible and not only in
+   the arrow shape. */
+.paths-table thead th.active {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 .paths-table thead a>span {
-  padding-left: 2px;
+  display: inline-flex;
+  align-items: center;
+  padding-left: 0.25em;
+  /* Inactive columns keep a quieter arrow, so the sorted one stands out. */
+  opacity: 0.55;
+}
+
+.paths-table thead th.active a>span {
+  opacity: 1;
 }
 
 .paths-table tbody tr:hover {
@@ -194,10 +217,17 @@ svg {
 }
 
 .paths-table .cell-actions {
-  /* Sized by its buttons (up to five, read-only entries get disabled ones)
-     instead of a fixed 90px they can outgrow. */
-  display: flex;
+  /* Five fixed slots, so the same action lines up on every row whether the row
+     has three buttons (a folder) or five (a file). */
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1.7em;
+  align-items: center;
   padding-left: 0.5em;
+}
+
+.action-slot {
+  display: block;
 }
 
 .paths-table .cell-mtime {
@@ -244,9 +274,40 @@ svg {
   cursor: pointer;
 }
 
+/* The row actions are buttons and links; strip the UA chrome so both look
+   identical, and give every one of them a real focus ring. */
+button.action-btn,
+button.control {
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+}
+
+button.action-btn {
+  display: inline-flex;
+  align-items: center;
+}
+
 .action-btn.disabled {
-  opacity: 0.35;
+  opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Visible focus for keyboard users on every control, in both themes. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--text-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.action-btn.disabled:focus-visible {
+  outline-color: var(--text-tertiary);
 }
 
 .uploaders-table {
@@ -263,8 +324,18 @@ svg {
   border: 1px solid var(--border-secondary);
   background: var(--bg-primary);
   color: var(--text-primary);
-  outline: none;
-  padding: 5px;
+  border-radius: 4px;
+  padding: 8px;
+  /* A file editor without a monospace face misaligns everything it shows. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  tab-size: 4;
+}
+
+.editor:focus-visible {
+  outline: 2px solid var(--text-accent);
+  outline-offset: -1px;
 }
 
 .toolbox-right {
@@ -272,18 +343,30 @@ svg {
   margin-right: 2em;
 }
 
-.login-btn {
+.login-btn,
+.logout-btn,
+.save-btn {
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  padding: 0;
   cursor: pointer;
 }
 
+button.toolbox-right,
+.save-btn svg,
+.login-btn svg,
+.logout-btn svg {
+  display: block;
+}
+
 .save-btn {
-  cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
 }
 
 .logout-btn {
-  cursor: pointer;
   display: flex;
   align-items: center;
 }
@@ -326,12 +409,14 @@ svg {
   }
 
   .toolbox>a,
-  .toolbox>div {
+  .toolbox>div,
+  .toolbox>button {
     height: auto;
   }
 
   .toolbox .control {
     display: flex;
+    width: 44px;
     align-items: center;
     justify-content: center;
     min-width: 44px;
@@ -402,6 +487,11 @@ svg {
     border-radius: 15px;
   }
 
+  .paths-table thead th.active a {
+    border-color: var(--text-accent);
+    color: var(--text-accent);
+  }
+
   .paths-table thead a>span {
     padding-left: 0.35em;
   }
@@ -433,8 +523,10 @@ svg {
 
   .paths-table .cell-actions {
     grid-area: 2 / 2;
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 44px;
+    justify-content: start;
     width: auto;
     padding: 0.15em 0 0;
   }
@@ -452,7 +544,7 @@ svg {
 
   .path-meta {
     display: block;
-    margin-top: 0.1em;
+    margin-top: 0;
     color: var(--text-secondary);
     font-size: 0.8em;
     font-variant-numeric: tabular-nums;
@@ -490,10 +582,21 @@ svg {
     min-height: 44px;
   }
 
+  /* A 44px-tall link on a one-line name pushed the metadata far below the text,
+     so wrapped and unwrapped rows spaced differently. Pad the link instead: the
+     same tap height, and the metadata always follows the last line directly. */
+  .paths-table .cell-name {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 44px;
+  }
+
   .path a {
     display: inline-flex;
     align-items: center;
     min-height: 44px;
+    padding: 0;
   }
 
   /* Upload progress is a card too: name and size on top, status underneath. */
@@ -561,12 +664,14 @@ svg {
     --bg-hover: #1a1a1a;
     --text-primary: #fff;
     --text-secondary: #ddd;
-    --text-tertiary: #586069;  /*Unchanged in both color schemes*/
+    /* Was #586069 in both schemes: 3.3:1 on black, under the 4.5 a text token
+       needs. Lightened for dark only; #586069 stays as the light colour. */
+    --text-tertiary: #9aa4ad;
     --text-accent: #3191ff;
     --svg-primary: #fff;
     --svg-secondary: #fff;
-    --svg-tertiary: #fff6;
-    --border-primary: #fff6;
+    --svg-tertiary: #ffffff99;
+    --border-primary: #ffffff40;
     --border-secondary: #ced4da; /*Unchanged in both color schemes*/
   }
 }

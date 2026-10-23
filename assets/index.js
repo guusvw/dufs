@@ -493,19 +493,24 @@ function renderPathsTableHead() {
     <tr>
       <th class="cell-icon"></th>
       ${headerItems.map(item => {
-    let svg = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M11.5 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L11 2.707V14.5a.5.5 0 0 0 .5.5zm-7-14a.5.5 0 0 1 .5.5v11.793l3.146-3.147a.5.5 0 0 1 .708.708l-4 4a.5.5 0 0 1-.708 0l-4-4a.5.5 0 0 1 .708-.708L4 13.293V1.5a.5.5 0 0 1 .5-.5z"/></svg>`;
-    let order = "desc";
-    if (PARAMS.sort === item.name) {
-      if (PARAMS.order === "desc") {
-        order = "asc";
-        svg = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 1a.5.5 0 0 1 .5.5v11.793l3.146-3.147a.5.5 0 0 1 .708.708l-4 4a.5.5 0 0 1-.708 0l-4-4a.5.5 0 0 1 .708-.708L7.5 13.293V1.5A.5.5 0 0 1 8 1z"/></svg>`
-      } else {
-        svg = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L7.5 2.707V14.5a.5.5 0 0 0 .5.5z"/></svg>`
-      }
-    }
+    // The server sorts by name ascending when no sort is asked for, so the
+    // default view is Name ascending, not an unsorted list.
+    const sortName = PARAMS.sort || "name";
+    const sortDesc = PARAMS.order === "desc";
+    const active = sortName === item.name;
+    const neutral = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M11.5 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L11 2.707V14.5a.5.5 0 0 0 .5.5zm-7-14a.5.5 0 0 1 .5.5v11.793l3.146-3.147a.5.5 0 0 1 .708.708l-4 4a.5.5 0 0 1-.708 0l-4-4a.5.5 0 0 1 .708-.708L4 13.293V1.5a.5.5 0 0 1 .5-.5z"/></svg>`;
+    const up = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 1a.5.5 0 0 1 .5.5v11.793l3.146-3.147a.5.5 0 0 1 .708.708l-4 4a.5.5 0 0 1-.708 0l-4-4a.5.5 0 0 1 .708-.708L7.5 13.293V1.5A.5.5 0 0 1 8 1z"/></svg>`;
+    const down = `<svg width="12" height="12" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 15a.5.5 0 0 0 .5-.5V2.707l3.146 3.147a.5.5 0 0 0 .708-.708l-4-4a.5.5 0 0 0-.708 0l-4 4a.5.5 0 1 0 .708.708L7.5 2.707V14.5a.5.5 0 0 0 .5.5z"/></svg>`;
+    const svg = active ? (sortDesc ? down : up) : neutral;
+    // Upstream's behaviour, kept: the active column flips, any other column
+    // starts descending.
+    const order = active && sortDesc ? "asc" : "desc";
     const qs = new URLSearchParams({ ...PARAMS, order, sort: item.name }).toString();
     const icon = `<span>${svg}</span>`
-    return `<th class="cell-${item.name}" ${item.props}><a href="?${qs}">${item.text}${icon}</a></th>`
+    // The active column says so, for sighted and screen-reader users alike.
+    const ariaSort = active ? `aria-sort="${sortDesc ? "descending" : "ascending"}"` : "";
+    const cls = active ? " active" : "";
+    return `<th class="cell-${item.name}${cls}" ${item.props} ${ariaSort}><a href="?${qs}">${item.text}${icon}</a></th>`
   }).join("\n")}
       <th class="cell-actions">Actions</th>
     </tr>
@@ -543,7 +548,7 @@ function renderPathsTableBody() {
  * @param {string} title
  */
 function disabledAction(icon, title) {
-  return `<span class="action-btn disabled" title="${title}" aria-disabled="true">${icon}</span>`;
+  return `<span class="action-btn disabled" title="${title}" aria-disabled="true" role="button" aria-label="${title}">${icon}</span>`;
 }
 
 /**
@@ -582,26 +587,26 @@ function addPath(file, index, showMove, showDelete) {
     if (DATA.allow_archive) {
       actionDownload = `
       <div class="action-btn">
-        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download>${ICONS.download}</a>
+        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download aria-label="Download ${encodedName} as a .zip file">${ICONS.download}</a>
       </div>`;
     }
   } else {
     actionDownload = `
     <div class="action-btn" >
-      <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
+      <a class="dlwt" href="${url}" title="Download file" download aria-label="Download ${encodedName}">${ICONS.download}</a>
     </div>`;
   }
   const canMove = file.allow_upload && file.allow_delete;
   const canEdit = !isDir && canMove;
   if (showMove) {
     if (canMove) {
-      actionMove = `<div onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename">${ICONS.move}</div>`;
+      actionMove = `<button type="button" onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename" aria-label="Move or rename ${encodedName}">${ICONS.move}</button>`;
     } else {
       actionMove = disabledAction(ICONS.move, `Cannot move: ${deniedReason(file, "move")}`);
     }
     if (!isDir) {
       if (canEdit) {
-        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit">${ICONS.edit}</a>`;
+        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit" aria-label="Edit ${encodedName}">${ICONS.edit}</a>`;
       } else {
         actionEdit = disabledAction(ICONS.edit, `Cannot edit: ${deniedReason(file, "edit")}`);
       }
@@ -610,21 +615,25 @@ function addPath(file, index, showMove, showDelete) {
   if (showDelete) {
     if (file.allow_delete) {
       actionDelete = `
-    <div onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete">${ICONS.delete}</div>`;
+    <button type="button" onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete" aria-label="Delete ${encodedName}">${ICONS.delete}</button>`;
     } else {
       actionDelete = disabledAction(ICONS.delete, `Cannot delete: ${deniedReason(file, "delete")}`);
     }
   }
   if (!canEdit && !isDir) {
-    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view" aria-label="View ${encodedName}">${ICONS.view}</a>`;
   }
+  // Every row gets the same five slots in the same order, so an action sits at
+  // the same x on every row even when a row has fewer buttons (a folder has no
+  // view or edit). Empty slots are invisible and only hold the column.
+  const slot = (html) => (html ? html : `<span class="action-slot"></span>`);
   let actionCell = `
   <td class="cell-actions">
-    ${actionDownload}
-    ${actionView}
-    ${actionMove}
-    ${actionDelete}
-    ${actionEdit}
+    ${slot(actionDownload)}
+    ${slot(actionView)}
+    ${slot(actionMove)}
+    ${slot(actionDelete)}
+    ${slot(actionEdit)}
   </td>`;
 
   let sizeDisplay = isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
