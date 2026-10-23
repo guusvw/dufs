@@ -90,10 +90,6 @@ let $emptyFolder;
 /**
  * @type Element
  */
-let $listingError;
-/**
- * @type Element
- */
 let $editor;
 /**
  * @type Element
@@ -147,7 +143,7 @@ const beforeUnloadHandler = (event) => {
 async function initialize() {
   const $indexData = document.getElementById('index-data');
   if (!$indexData) {
-    alert("No data");
+    showNotice("No data");
     return;
   }
 
@@ -170,7 +166,6 @@ async function ready() {
   $pathsTableBody = document.querySelector(".paths-table tbody");
   $uploadersTable = document.querySelector(".uploaders-table");
   $emptyFolder = document.querySelector(".empty-folder");
-  $listingError = document.querySelector(".listing-error");
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
@@ -677,12 +672,11 @@ async function fetchListing() {
     if (!Array.isArray(data.paths)) throw new Error("Unexpected response");
     DATA.paths = data.paths;
     DATA.dir_exists = data.dir_exists;
-    $listingError.classList.add("hidden");
+    clearNotice("listing");
     renderPathsTableBody();
   } catch (err) {
     // Leave the old listing in place.
-    $listingError.textContent = `Could not refresh the listing: ${err.message}`;
-    $listingError.classList.remove("hidden");
+    showNotice(`Could not refresh the listing: ${err.message}`, "listing");
   }
 }
 
@@ -863,7 +857,7 @@ function setupDownloadWithToken() {
       tempA.click();
       document.body.removeChild(tempA);
     } catch (err) {
-      alert(`Failed to download, ${err.message}`);
+      showNotice(`Failed to download, ${err.message}`);
     }
   });
 }
@@ -901,8 +895,10 @@ function setupUploadFile() {
 function setupNewFolder() {
   const $newFolder = document.querySelector(".new-folder");
   $newFolder.classList.remove("hidden");
-  $newFolder.addEventListener("click", () => {
-    const name = prompt("Enter folder name");
+  $newFolder.addEventListener("click", async () => {
+    const name = await promptDialog("New folder", "Folder name", "", nameValidator(n => `A file or folder named \u201c${n}\u201d already exists here.`), {
+      confirmLabel: "Create",
+    });
     if (name) createFolder(name);
   });
 }
@@ -910,8 +906,10 @@ function setupNewFolder() {
 function setupNewFile() {
   const $newFile = document.querySelector(".new-file");
   $newFile.classList.remove("hidden");
-  $newFile.addEventListener("click", () => {
-    const name = prompt("Enter file name");
+  $newFile.addEventListener("click", async () => {
+    const name = await promptDialog("New file", "File name", "", nameValidator(n => `\u201c${n}\u201d already exists here and would be replaced.`), {
+      confirmLabel: "Create",
+    });
     if (name) createFile(name);
   });
 }
@@ -1002,7 +1000,7 @@ async function setupEditorPage() {
     }
     editorSavedValue = $editor.value;
   } catch (err) {
-    alert(`Failed to get file, ${err.message}`);
+    showNotice(`Failed to get file, ${err.message}`);
   }
 }
 
@@ -1041,11 +1039,26 @@ async function deletePath(name) {
     DATA.paths.splice(index, 1);
     renderPathsTableBody(focus);
     refreshListing();
-  });
+  }, file);
 }
 
-async function doDeletePath(name, url, cb) {
-  if (!confirm(`Delete \`${name}\`?`)) return;
+/**
+ * Confirm, then delete an entry.
+ * @param {string} name
+ * @param {string} url
+ * @param {() => void} cb  runs after a successful delete
+ * @param {PathItem} [entry]  the listed entry; absent for the open file
+ */
+async function doDeletePath(name, url, cb, entry) {
+  const isDir = !!entry?.path_type.endsWith("Dir");
+  const body = isDir
+    ? `The folder \u201c${name}\u201d and everything in it (${formatDirSize(entry.size).trim()}) will be deleted. This cannot be undone.`
+    : `The file \u201c${name}\u201d will be deleted. This cannot be undone.`;
+  const confirmed = await confirmDialog(isDir ? "Delete folder?" : "Delete file?", body, {
+    danger: true,
+    confirmLabel: "Delete",
+  });
+  if (!confirmed) return;
   try {
     await checkAuth();
     const res = await fetch(url, {
@@ -1055,11 +1068,11 @@ async function doDeletePath(name, url, cb) {
     cb();
   } catch (err) {
     if (err.code === "readonly-descendant") {
-      alert(`Cannot delete \`${name}\`: the directory contains read-only entries`);
+      showNotice(`Cannot delete \`${name}\`: the directory contains read-only entries`);
     } else if (err.code === "delete-disabled") {
-      alert(`Cannot delete \`${name}\`: delete is disabled`);
+      showNotice(`Cannot delete \`${name}\`: delete is disabled`);
     } else {
-      alert(`Cannot delete \`${name}\`, ${err.message}`);
+      showNotice(`Cannot delete \`${name}\`, ${err.message}`);
     }
   }
 }
@@ -1073,50 +1086,68 @@ async function movePath(name) {
   const file = DATA.paths.find(p => p.name === name);
   if (!file) return;
   const fileUrl = newUrl(file.name);
-  const newFileUrl = await doMovePath(fileUrl);
+  const newFileUrl = await doMovePath(fileUrl, file.path_type.endsWith("Dir"));
   if (newFileUrl) {
     location.href = newFileUrl.split("/").slice(0, -1).join("/");
   }
 }
 
-async function doMovePath(fileUrl) {
+/**
+ * Ask for the new path of an entry and move it there.
+ * @param {string} fileUrl
+ * @param {boolean} [isDir]
+ * @returns {Promise<string | undefined>} the new URL, or undefined when
+ * cancelled or failed
+ */
+async function doMovePath(fileUrl, isDir = false) {
   const fileUrlObj = new URL(fileUrl);
 
   const prefix = DATA.uri_prefix.slice(0, -1);
 
   const filePath = decodeURIComponent(fileUrlObj.pathname.slice(prefix.length));
+  const toUrl = path => fileUrlObj.origin + prefix + path.split("/").map(encodeURIComponent).join("/");
 
-  let newPath = prompt("Enter new path", filePath);
-  if (!newPath) return;
-  if (!newPath.startsWith("/")) newPath = "/" + newPath;
-  if (filePath === newPath) return;
-  const newFileUrl = fileUrlObj.origin + prefix + newPath.split("/").map(encodeURIComponent).join("/");
+  // Select the base name only, without the extension of a file.
+  const nameStart = filePath.lastIndexOf("/") + 1;
+  const nameEnd = isDir ? filePath.length : filePath.length - extName(filePath.slice(nameStart)).length;
+
+  const value = await promptDialog(
+    isDir ? "Move or rename folder" : "Move or rename file",
+    "New path",
+    filePath,
+    movePathValidator(filePath),
+    {
+      confirmLabel: "Move",
+      selection: [nameStart, nameEnd],
+      beforeSubmit: async value => {
+        await checkAuth();
+        const res = await fetch(toUrl(normalizeMovePath(value)), {
+          method: "HEAD",
+        });
+        return res.status === 200 ? "Override existing file" : null;
+      },
+    },
+  );
+  if (value === null) return;
+  const newPath = normalizeMovePath(value);
+  const newFileUrl = toUrl(newPath);
 
   try {
-    await checkAuth();
-    const res1 = await fetch(newFileUrl, {
-      method: "HEAD",
-    });
-    if (res1.status === 200) {
-      if (!confirm("Override existing file?")) {
-        return;
-      }
-    }
-    const res2 = await fetch(fileUrl, {
+    const res = await fetch(fileUrl, {
       method: "MOVE",
       headers: {
         "Destination": newFileUrl,
       }
     });
-    await assertResOK(res2);
+    await assertResOK(res);
     return newFileUrl;
   } catch (err) {
     if (err.code === "readonly-descendant") {
-      alert(`Cannot move \`${filePath}\`: the directory contains read-only entries`);
+      showNotice(`Cannot move \`${filePath}\`: the directory contains read-only entries`);
     } else if (err.code === "upload-disabled" || err.code === "delete-disabled") {
-      alert(`Cannot move \`${filePath}\`: moving is disabled`);
+      showNotice(`Cannot move \`${filePath}\`: moving is disabled`);
     } else {
-      alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+      showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
     }
   }
 }
@@ -1289,11 +1320,11 @@ async function createFolder(name) {
     location.href = url;
   } catch (err) {
     if (err.code === "already-exists") {
-      alert(`Cannot create folder \`${name}\`: it already exists`);
+      showNotice(`Cannot create folder \`${name}\`: it already exists`);
     } else if (err.code === "upload-disabled") {
-      alert(`Cannot create folder \`${name}\`: upload is disabled`);
+      showNotice(`Cannot create folder \`${name}\`: upload is disabled`);
     } else {
-      alert(`Cannot create folder \`${name}\`, ${err.message}`);
+      showNotice(`Cannot create folder \`${name}\`, ${err.message}`);
     }
   }
 }
@@ -1310,11 +1341,11 @@ async function createFile(name) {
     location.href = url + "?edit";
   } catch (err) {
     if (err.code === "upload-disabled") {
-      alert(`Cannot create file \`${name}\`: upload is disabled`);
+      showNotice(`Cannot create file \`${name}\`: upload is disabled`);
     } else if (err.code === "delete-disabled") {
-      alert(`Cannot create file \`${name}\`: delete is disabled`);
+      showNotice(`Cannot create file \`${name}\`: delete is disabled`);
     } else {
-      alert(`Cannot create file \`${name}\`, ${err.message}`);
+      showNotice(`Cannot create file \`${name}\`, ${err.message}`);
     }
   }
 }
@@ -1437,6 +1468,296 @@ const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'
  */
 function escapeHtml(rawStr) {
   return String(rawStr).replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
+}
+
+/**
+ * Create an element, optionally with a class name and text content.
+ * @param {string} tag
+ * @param {string} [className]
+ * @param {string} [text]
+ */
+function createElement(tag, className, text) {
+  const $el = document.createElement(tag);
+  if (className) $el.className = className;
+  if (text !== undefined) $el.textContent = text;
+  return $el;
+}
+
+let dialogSeq = 0;
+
+/**
+ * Build the shell shared by every dialog: a title, a body slot and a Cancel /
+ * confirm button pair. The confirm button submits the form; Cancel closes the
+ * dialog without a result, like Escape does.
+ * @param {string} title
+ * @param {string} confirmLabel
+ * @param {boolean} danger
+ */
+function createDialog(title, confirmLabel, danger) {
+  const id = ++dialogSeq;
+  const $dialog = createElement("dialog", "dialog");
+  $dialog.setAttribute("aria-labelledby", `dialog-title-${id}`);
+  const $form = createElement("form", "dialog-form");
+  $form.noValidate = true;
+  const $title = createElement("h2", "dialog-title", title);
+  $title.id = `dialog-title-${id}`;
+  const $body = createElement("div", "dialog-body");
+  const $actions = createElement("div", "dialog-actions");
+  const $cancel = createElement("button", "dialog-btn", "Cancel");
+  $cancel.type = "button";
+  $cancel.addEventListener("click", () => $dialog.close());
+  const $ok = createElement("button", danger ? "dialog-btn dialog-ok danger" : "dialog-btn dialog-ok", confirmLabel);
+  $ok.type = "submit";
+  $actions.append($cancel, $ok);
+  $form.append($title, $body, $actions);
+  $dialog.append($form);
+  return { id, $dialog, $form, $body, $cancel, $ok };
+}
+
+/**
+ * Open a dialog modally. Resolves with true once it is closed through its
+ * confirm button (`close("ok")`) and false when it is cancelled.
+ * @param {HTMLDialogElement} $dialog
+ * @returns {Promise<boolean>}
+ */
+function showDialog($dialog) {
+  return new Promise(resolve => {
+    $dialog.addEventListener("close", () => {
+      $dialog.remove();
+      resolve($dialog.returnValue === "ok");
+    }, { once: true });
+    document.body.append($dialog);
+    $dialog.showModal();
+  });
+}
+
+/**
+ * Ask for confirmation. Resolves with true when confirmed. A danger dialog
+ * starts with the focus on Cancel.
+ * @param {string} title
+ * @param {string} body
+ * @param {{danger?: boolean, confirmLabel?: string}} [options]
+ * @returns {Promise<boolean>}
+ */
+function confirmDialog(title, body, { danger = false, confirmLabel = "OK" } = {}) {
+  const d = createDialog(title, confirmLabel, danger);
+  const $text = createElement("p", "dialog-text", body);
+  $text.id = `dialog-text-${d.id}`;
+  d.$dialog.setAttribute("aria-describedby", $text.id);
+  d.$body.append($text);
+  d.$form.addEventListener("submit", e => {
+    e.preventDefault();
+    d.$dialog.close("ok");
+  });
+  const closed = showDialog(d.$dialog);
+  (danger ? d.$cancel : d.$ok).focus();
+  return closed;
+}
+
+/**
+ * @typedef {object} Problem
+ * @property {"error"|"warn"} level  errors block the submit, warnings do not
+ * @property {string} message
+ */
+
+/**
+ * Ask for a line of text. Resolves with the trimmed text, or null when
+ * cancelled. `validate` runs on every input and again on submit.
+ * `beforeSubmit` may resolve with the label of an acknowledgement checkbox
+ * that has to be ticked, in the same dialog, before the dialog accepts.
+ * @param {string} title
+ * @param {string} label
+ * @param {string} initial
+ * @param {(value: string) => Problem | null} validate
+ * @param {{confirmLabel?: string, selection?: [number, number], beforeSubmit?: (value: string) => Promise<string | null>}} [options]
+ * @returns {Promise<string | null>}
+ */
+function promptDialog(title, label, initial, validate, { confirmLabel = "OK", selection, beforeSubmit } = {}) {
+  const d = createDialog(title, confirmLabel, false);
+  const $label = createElement("label", "dialog-label", label);
+  $label.htmlFor = `dialog-input-${d.id}`;
+  const $input = createElement("input", "dialog-input");
+  $input.id = `dialog-input-${d.id}`;
+  $input.type = "text";
+  $input.value = initial;
+  $input.autocomplete = "off";
+  $input.spellcheck = false;
+  $input.setAttribute("autocapitalize", "off");
+  const $msg = createElement("p", "dialog-msg");
+  $msg.id = `dialog-msg-${d.id}`;
+  $msg.setAttribute("aria-live", "polite");
+  $input.setAttribute("aria-describedby", $msg.id);
+  const $ack = createElement("label", "dialog-ack hidden");
+  const $check = createElement("input");
+  $check.type = "checkbox";
+  const $ackText = createElement("span");
+  $ack.append($check, $ackText);
+  d.$body.append($label, $input, $msg, $ack);
+
+  let result = null;
+  // The value the acknowledgement checkbox was asked for.
+  let ackFor = null;
+  let busy = false;
+
+  /** @param {Problem | null} problem */
+  const showProblem = problem => {
+    $msg.textContent = problem ? problem.message : "";
+    $msg.dataset.level = problem ? problem.level : "";
+    if (problem?.level === "error") {
+      $input.setAttribute("aria-invalid", "true");
+    } else {
+      $input.removeAttribute("aria-invalid");
+    }
+  };
+
+  $input.addEventListener("input", () => {
+    const value = $input.value.trim();
+    showProblem(validate(value));
+    if (value !== ackFor) {
+      ackFor = null;
+      $ack.classList.add("hidden");
+    }
+  });
+
+  d.$form.addEventListener("submit", async e => {
+    e.preventDefault();
+    if (busy) return;
+    const value = $input.value.trim();
+    const problem = validate(value);
+    showProblem(problem);
+    if (problem?.level === "error") {
+      $input.focus();
+      return;
+    }
+    if (ackFor === value) {
+      if (!$check.checked) {
+        showProblem({ level: "error", message: "Tick the box to continue." });
+        $check.focus();
+        return;
+      }
+    } else if (beforeSubmit) {
+      busy = true;
+      d.$ok.setAttribute("aria-disabled", "true");
+      let ackLabel;
+      try {
+        ackLabel = await beforeSubmit(value);
+      } catch (err) {
+        showProblem({ level: "error", message: err.message });
+        $input.focus();
+        return;
+      } finally {
+        busy = false;
+        d.$ok.removeAttribute("aria-disabled");
+      }
+      // Edited while checking: the answer is for another value.
+      if ($input.value.trim() !== value) return;
+      if (ackLabel) {
+        ackFor = value;
+        $check.checked = false;
+        $ackText.textContent = ackLabel;
+        $ack.classList.remove("hidden");
+        $check.focus();
+        return;
+      }
+    }
+    result = value;
+    d.$dialog.close("ok");
+  });
+
+  const closed = showDialog(d.$dialog);
+  $input.focus();
+  if (selection) {
+    $input.setSelectionRange(selection[0], selection[1]);
+  } else {
+    $input.select();
+  }
+  return closed.then(ok => (ok ? result : null));
+}
+
+/**
+ * Show a dismissible notice at the top of the main area. A notice with the
+ * same key is replaced; the key defaults to the message.
+ * @param {string} message
+ * @param {string} [key]
+ */
+function showNotice(message, key = message) {
+  clearNotice(key);
+  const $notice = createElement("div", "notice");
+  $notice.dataset.key = key;
+  const $dismiss = createElement("button", "notice-dismiss", "\u00d7");
+  $dismiss.type = "button";
+  $dismiss.setAttribute("aria-label", "Dismiss");
+  $dismiss.addEventListener("click", () => $notice.remove());
+  $notice.append(createElement("span", "notice-text", message), $dismiss);
+  document.querySelector(".notices").append($notice);
+  $notice.scrollIntoView({ block: "nearest" });
+}
+
+/**
+ * Remove the notice shown under `key`, if any.
+ * @param {string} key
+ */
+function clearNotice(key) {
+  for (const $notice of document.querySelectorAll(".notice")) {
+    if ($notice.dataset.key === key) $notice.remove();
+  }
+}
+
+/**
+ * Validator for the name of a new entry: no slash, not `.` or `..`. A name
+ * that is already listed is a warning, not an error.
+ * @param {(name: string) => string} existsMessage
+ * @returns {(name: string) => Problem | null}
+ */
+function nameValidator(existsMessage) {
+  return name => {
+    if (!name) return { level: "error", message: "Enter a name." };
+    if (name.includes("/")) return { level: "error", message: "A name cannot contain \u201c/\u201d." };
+    if (name === "." || name === "..") return { level: "error", message: `\u201c${name}\u201d is not a valid name.` };
+    if (DATA.paths.some(p => p.name === name)) return { level: "warn", message: existsMessage(name) };
+    return null;
+  };
+}
+
+/**
+ * Normalise the text typed into the move dialog to an absolute path without a
+ * trailing slash ("" is the root).
+ * @param {string} value
+ */
+function normalizeMovePath(value) {
+  const path = value.startsWith("/") ? value : "/" + value;
+  return path.replace(/\/+$/, "");
+}
+
+/**
+ * @param {string} path  absolute path without a trailing slash
+ */
+function parentPath(path) {
+  return path.slice(0, path.lastIndexOf("/"));
+}
+
+/**
+ * Validator for the move dialog. Slashes are allowed, `.` and `..` segments
+ * are not. A target next to the moved entry that is already listed is a
+ * warning.
+ * @param {string} filePath  current path of the moved entry
+ * @returns {(value: string) => Problem | null}
+ */
+function movePathValidator(filePath) {
+  return value => {
+    const newPath = normalizeMovePath(value);
+    if (!newPath) return { level: "error", message: "Enter a path." };
+    const segments = newPath.split("/").slice(1);
+    if (segments.some(s => s === "" || s === "." || s === "..")) {
+      return { level: "error", message: "A path cannot contain empty, \u201c.\u201d or \u201c..\u201d segments." };
+    }
+    if (newPath === filePath) return { level: "error", message: "That is the current path." };
+    const name = segments[segments.length - 1];
+    if (parentPath(newPath) === parentPath(filePath) && DATA.paths.some(p => p.name === name)) {
+      return { level: "warn", message: `\u201c${name}\u201d already exists here.` };
+    }
+    return null;
+  };
 }
 
 async function assertResOK(res) {
