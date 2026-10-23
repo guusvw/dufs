@@ -548,7 +548,7 @@ class Uploader {
             } else if (code === "readonly-descendant") {
               this.fail("directory contains read-only entries");
             } else {
-              this.fail(ioErrorReason(code) || `${ajax.status} ${ajax.statusText}`);
+              this.fail(codeReason(code) || `${ajax.status} ${ajax.statusText}`);
             }
           }
         }
@@ -1530,7 +1530,7 @@ async function deletePath(name) {
 async function doDeletePath(name, url, cb, entry) {
   const isDir = !!entry?.path_type.endsWith("Dir");
   const body = isDir
-    ? `The folder \u201c${name}\u201d and everything in it (${formatDirSize(entry.size).trim()}) will be deleted. This cannot be undone.`
+    ? `The folder \u201c${name}\u201d and everything in it${entry.size === null ? "" : ` (${formatDirSize(entry.size).trim()})`} will be deleted. This cannot be undone.`
     : `The file \u201c${name}\u201d will be deleted. This cannot be undone.`;
   const confirmed = await confirmDialog(isDir ? "Delete folder?" : "Delete file?", body, {
     danger: true,
@@ -1549,7 +1549,7 @@ async function doDeletePath(name, url, cb, entry) {
     if (blocked) {
       showNotice(`Cannot delete \`${name}\`: ${blocked}`);
     } else {
-      showNotice(`Cannot delete \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
+      showNotice(`Cannot delete \`${name}\`, ${codeReason(err.code) || err.message}`);
     }
   }
 }
@@ -1623,7 +1623,7 @@ async function doMovePath(fileUrl, isDir = false) {
     if (blocked) {
       showNotice(`Cannot move \`${filePath}\`: ${blocked}`);
     } else {
-      showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${ioErrorReason(err.code) || err.message}`);
+      showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${codeReason(err.code) || err.message}`);
     }
   }
 }
@@ -1884,7 +1884,7 @@ async function bulkDelete(entries) {
       await assertResOK(res);
       deleted.add(file.name);
     } catch (err) {
-      failures.push(`${file.name} (${deleteBlockedReason(err) || err.message})`);
+      failures.push(`${file.name} (${deleteBlockedReason(err) || codeReason(err.code) || err.message})`);
     }
   }
   forgetEntries(deleted);
@@ -2045,6 +2045,8 @@ async function saveChange(overwrite) {
       showEditorError(`Cannot save \`${name}\`: delete is disabled`);
     } else if (err.code === "readonly-descendant") {
       showEditorError(`Cannot save \`${name}\`: it is read-only`);
+    } else if (codeReason(err.code)) {
+      showEditorError(`Cannot save \`${name}\`, ${codeReason(err.code)}`);
     } else if (err.status) {
       showEditorError(`Cannot save \`${name}\`, ${err.status} ${err.body}`.trimEnd());
     } else {
@@ -2175,7 +2177,7 @@ async function createFolder(name) {
     } else if (err.code === "upload-disabled") {
       showNotice(`Cannot create folder \`${name}\`: upload is disabled`);
     } else {
-      showNotice(`Cannot create folder \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
+      showNotice(`Cannot create folder \`${name}\`, ${codeReason(err.code) || err.message}`);
     }
   }
 }
@@ -2196,7 +2198,7 @@ async function createFile(name) {
     } else if (err.code === "delete-disabled") {
       showNotice(`Cannot create file \`${name}\`: delete is disabled`);
     } else {
-      showNotice(`Cannot create file \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
+      showNotice(`Cannot create file \`${name}\`, ${codeReason(err.code) || err.message}`);
     }
   }
 }
@@ -2638,18 +2640,24 @@ function movePathValidator(filePath) {
 }
 
 /**
- * Short reason for an error code caused by a file system failure on the server
+ * Short reason for an error code the server did not explain in the response
+ * body: file system failures and the resumable upload protocol.
  * @param {string|null} code value of the x-dufs-error-code header
  * @returns {string|undefined}
  */
-function ioErrorReason(code) {
+function codeReason(code) {
   switch (code) {
     case "permission-denied": return "permission denied by the server file system";
     case "conflict": return "a parent path is not a directory or the target already exists";
     case "is-a-directory": return "the target is a directory";
     case "insufficient-storage": return "the server is out of storage space";
+    case "upload-not-found": return "the server no longer has this upload; retry to start it again";
+    case "upload-offset-mismatch": return "the server received a different amount than expected; retry to continue";
+    case "upload-id-in-use": return "the server is still receiving this upload; retry in a moment";
+    case "invalid-upload-id": return "the server rejected the upload id; retry to start it again";
   }
 }
+
 async function assertResOK(res) {
   if (!(res.status >= 200 && res.status < 300)) {
     const body = await res.text();
