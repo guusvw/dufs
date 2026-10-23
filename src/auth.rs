@@ -1,6 +1,6 @@
 use crate::{args::Args, server::Response, utils::unix_now};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey};
 use headers::HeaderValue;
@@ -26,6 +26,11 @@ const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60; // 1 hour
 /// the cap keeps a long-running server's memory use predictable.
 const MAX_NONCE_COUNTS: usize = 10_000;
 const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
+/// First byte of every share token. Bump it whenever the token layout or the
+/// key derivation changes so tokens of the old scheme are rejected up front.
+const TOKEN_VERSION: u8 = 1;
+/// Length in bytes of the secret that share-token signing keys derive from.
+pub const TOKEN_SECRET_LEN: usize = 32;
 /// Upper bound on the depth of an auth rule path. The permission tree is built
 /// and traversed recursively, so an absurdly deep rule would otherwise risk a
 /// stack overflow (which aborts the process under `panic = "abort"`).
@@ -52,6 +57,9 @@ pub struct AccessControl {
     use_hashed_password: bool,
     users: IndexMap<String, (String, AccessPaths)>,
     anonymous: Option<AccessPaths>,
+    /// Server-side secret that share-token signing keys derive from. Random
+    /// per process unless replaced with [`AccessControl::set_token_secret`].
+    token_secret: [u8; TOKEN_SECRET_LEN],
 }
 
 impl Default for AccessControl {
@@ -61,6 +69,7 @@ impl Default for AccessControl {
             use_hashed_password: false,
             users: IndexMap::new(),
             anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
+            token_secret: random_token_secret(),
         }
     }
 }
@@ -123,7 +132,14 @@ impl AccessControl {
             use_hashed_password,
             users,
             anonymous,
+            token_secret: random_token_secret(),
         })
+    }
+
+    /// Replace the random per-process token secret, e.g. with one that is
+    /// persisted so share tokens survive a restart.
+    pub fn set_token_secret(&mut self, secret: [u8; TOKEN_SECRET_LEN]) {
+        self.token_secret = secret;
     }
 
     pub fn has_users(&self) -> bool {
@@ -218,33 +234,41 @@ impl AccessControl {
     }
 
     pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
-        let (pass, _) = self
-            .users
-            .get(user)
-            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        if !self.users.contains_key(user) {
+            bail!("Not found user '{user}'");
+        }
         let exp = (unix_now().as_millis() as u64).saturating_add(TOKEN_EXPIRATION);
-        let message = format!("{path}:{exp}");
-        let signing_key = derive_secret_key(user, pass);
-        let sig = signing_key.sign(message.as_bytes()).to_bytes();
+        Ok(self.sign_token(path, user, exp))
+    }
 
-        let mut raw = Vec::with_capacity(64 + 8 + user.len());
+    /// Token layout: version (1 byte), signature (64), expiry in unix
+    /// milliseconds (8, big endian), user name (rest).
+    fn sign_token(&self, path: &str, user: &str, exp: u64) -> String {
+        let message = format!("{path}:{exp}");
+        let sig = self
+            .token_signing_key(user)
+            .sign(message.as_bytes())
+            .to_bytes();
+
+        let mut raw = Vec::with_capacity(1 + 64 + 8 + user.len());
+        raw.push(TOKEN_VERSION);
         raw.extend_from_slice(&sig);
         raw.extend_from_slice(&exp.to_be_bytes());
         raw.extend_from_slice(user.as_bytes());
 
-        Ok(hex::encode(raw))
+        hex::encode(raw)
     }
 
     fn verify_token<'a>(&'a self, token: &str, path: &str) -> Result<(String, &'a AccessPaths)> {
         let raw = hex::decode(token)?;
 
-        if raw.len() < 72 {
+        if raw.len() < 73 || raw[0] != TOKEN_VERSION {
             bail!("Invalid token");
         }
 
-        let sig_bytes = &raw[..64];
-        let exp_bytes = &raw[64..72];
-        let user_bytes = &raw[72..];
+        let sig_bytes = &raw[1..65];
+        let exp_bytes = &raw[65..73];
+        let user_bytes = &raw[73..];
 
         let exp = u64::from_be_bytes(exp_bytes.try_into()?);
         if unix_now().as_millis() as u64 > exp {
@@ -252,7 +276,7 @@ impl AccessControl {
         }
 
         let user = std::str::from_utf8(user_bytes)?;
-        let (pass, ap) = self
+        let (_, ap) = self
             .users
             .get(user)
             .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
@@ -260,8 +284,15 @@ impl AccessControl {
         let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes)?);
 
         let message = format!("{path}:{exp}");
-        derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
+        self.token_signing_key(user)
+            .verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
+    }
+
+    /// Signing key of `user`: `HMAC-SHA256(token_secret, user)` as the Ed25519
+    /// seed. It depends on neither the password nor its hash.
+    fn token_signing_key(&self, user: &str) -> SigningKey {
+        SigningKey::from_bytes(&hmac_sha256(&self.token_secret, user.as_bytes()))
     }
 }
 
@@ -827,11 +858,87 @@ fn record_nonce_count(nonce: &str, user: &str, nc: &[u8]) -> bool {
     }
 }
 
-fn derive_secret_key(user: &str, pass: &str) -> SigningKey {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{user}:{pass}").as_bytes());
-    let hash = hasher.finalize();
-    SigningKey::from_bytes(&hash.into())
+/// Load the share-token secret from `path`: [`TOKEN_SECRET_LEN`] random bytes
+/// as hex. A missing file is created with a fresh secret (mode `0600` on
+/// Unix) so the secret is stable across restarts. On Unix a file that other
+/// users can access is refused, as anyone who reads it can mint tokens.
+pub fn load_token_secret(path: &Path) -> Result<[u8; TOKEN_SECRET_LEN]> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            let secret = random_token_secret();
+            writeln!(file, "{}", hex::encode(secret))
+                .with_context(|| format!("Failed to write token secret to {}", path.display()))?;
+            return Ok(secret);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to create token secret {}", path.display()))
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("Failed to read token secret {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "Token secret {} is accessible by other users (mode {:04o}), run `chmod 600`",
+                path.display(),
+                mode & 0o7777
+            );
+        }
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read token secret {}", path.display()))?;
+    hex::decode(contents.trim())
+        .ok()
+        .and_then(|bytes| <[u8; TOKEN_SECRET_LEN]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "Token secret {} must hold {TOKEN_SECRET_LEN} bytes as {} hex digits",
+                path.display(),
+                TOKEN_SECRET_LEN * 2
+            )
+        })
+}
+
+fn random_token_secret() -> [u8; TOKEN_SECRET_LEN] {
+    let mut secret = [0u8; TOKEN_SECRET_LEN];
+    // Without an OS entropy source no secret can be trusted, so refuse to run.
+    getrandom::fill(&mut secret).expect("Failed to read random bytes from the OS");
+    secret
+}
+
+/// HMAC-SHA256 (RFC 2104).
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let ipad = block.map(|b| b ^ 0x36);
+    let opad = block.map(|b| b ^ 0x5c);
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 
 /// Layout of a digest nonce: 8 hex digits of time, 16 hex digits of randomness
@@ -1493,5 +1600,107 @@ mod tests {
             .filter_map(|v| v.to_str().ok())
             .collect();
         assert!(challenges.iter().all(|v| !v.contains("stale=true")));
+    }
+
+    fn token_auth(rules: &[&str]) -> AccessControl {
+        AccessControl::new(rules).unwrap()
+    }
+
+    #[test]
+    fn test_hmac_sha256_rfc4231() {
+        // RFC 4231 test cases 1, 2 and 6 (key longer than the block size).
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn test_token_roundtrip() {
+        let auth = token_auth(&["user:pass@/:rw"]);
+        let token = auth.generate_token("/file", "user").unwrap();
+        let (user, _) = auth.verify_token(&token, "/file").unwrap();
+        assert_eq!(user, "user");
+        // Bound to the path.
+        assert!(auth.verify_token(&token, "/other").is_err());
+        assert!(auth.generate_token("/file", "nobody").is_err());
+    }
+
+    #[test]
+    fn test_token_expired() {
+        let auth = token_auth(&["user:pass@/:rw"]);
+        let now = unix_now().as_millis() as u64;
+        let fresh = auth.sign_token("/file", "user", now + 60_000);
+        assert!(auth.verify_token(&fresh, "/file").is_ok());
+        let expired = auth.sign_token("/file", "user", now - 1);
+        assert!(auth.verify_token(&expired, "/file").is_err());
+    }
+
+    #[test]
+    fn test_token_rejects_other_version() {
+        let auth = token_auth(&["user:pass@/:rw"]);
+        let token = auth.generate_token("/file", "user").unwrap();
+        let mut raw = hex::decode(&token).unwrap();
+        assert_eq!(raw[0], TOKEN_VERSION);
+        raw[0] = TOKEN_VERSION + 1;
+        assert!(auth.verify_token(&hex::encode(raw), "/file").is_err());
+    }
+
+    #[test]
+    fn test_token_depends_on_secret_not_password() {
+        let rules = ["user:pass@/:rw"];
+        let mut a = token_auth(&rules);
+        let mut b = token_auth(&rules);
+        let token = a.generate_token("/file", "user").unwrap();
+        // Another process with another random secret does not accept it.
+        assert!(b.verify_token(&token, "/file").is_err());
+        // The same secret does, even with a different password for the user.
+        a.set_token_secret([7; TOKEN_SECRET_LEN]);
+        b = token_auth(&["user:other@/:rw"]);
+        b.set_token_secret([7; TOKEN_SECRET_LEN]);
+        let token = a.generate_token("/file", "user").unwrap();
+        assert!(b.verify_token(&token, "/file").is_ok());
+        // Rotating the secret invalidates it.
+        b.set_token_secret([8; TOKEN_SECRET_LEN]);
+        assert!(b.verify_token(&token, "/file").is_err());
+    }
+
+    #[test]
+    fn test_load_token_secret() {
+        let dir = std::env::temp_dir().join(format!("dufs-secret-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secret");
+
+        let created = load_token_secret(&path).unwrap();
+        assert_eq!(load_token_secret(&path).unwrap(), created);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load_token_secret(&path).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&path, "abcd\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(load_token_secret(&path).is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
