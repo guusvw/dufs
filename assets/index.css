@@ -111,6 +111,57 @@ svg {
   border: 0;
 }
 
+/* Full-viewport drop target, shown while files are dragged over the page. */
+.drop-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  box-sizing: border-box;
+  padding: 16px;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.drop-overlay.visible {
+  display: flex;
+  animation: drop-overlay-in .15s ease-out;
+}
+
+.drop-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-color: var(--bg-primary);
+  opacity: .92;
+}
+
+.drop-overlay-message {
+  position: relative;
+  box-sizing: border-box;
+  max-width: 100%;
+  padding: 32px 24px;
+  border: 3px dashed var(--text-accent);
+  border-radius: 12px;
+  font-size: 1.5rem;
+  text-align: center;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+
+@keyframes drop-overlay-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop-overlay.visible {
+    animation: none;
+  }
+}
+
 .toolbox {
   display: flex;
   margin-right: 10px;

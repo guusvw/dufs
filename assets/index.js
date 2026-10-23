@@ -729,18 +729,66 @@ function addPath(file, index, showMove, showDelete) {
 </tr>`);
 }
 
+/**
+ * @param {DragEvent} e
+ * @returns {boolean} whether the drag carries files, as opposed to text or links
+ */
+function dragHasFiles(e) {
+  return !!e.dataTransfer && Array.from(e.dataTransfer.types).includes("Files");
+}
+
 function setupDropzone() {
-  ["drag", "dragstart", "dragend", "dragover", "dragenter", "dragleave", "drop"].forEach(name => {
-    document.addEventListener(name, e => {
-      e.preventDefault();
-      e.stopPropagation();
-    });
+  // Purely visual: hidden from assistive technology, the drop result is
+  // announced through the live region. It ignores the pointer so it never
+  // becomes the target of the drag events it is reacting to.
+  const $overlay = document.createElement("div");
+  $overlay.className = "drop-overlay";
+  $overlay.setAttribute("aria-hidden", "true");
+  const $message = document.createElement("div");
+  $message.className = "drop-overlay-message";
+  const $folder = document.createElement("strong");
+  $folder.textContent = DATA.href;
+  $message.append("Drop to upload to ", $folder);
+  $overlay.append($message);
+  document.body.append($overlay);
+
+  // dragenter/dragleave fire for every element crossed, so count them and
+  // show the overlay only while the drag is inside the window.
+  let depth = 0;
+  const hideOverlay = () => {
+    depth = 0;
+    $overlay.classList.remove("visible");
+  };
+
+  document.addEventListener("dragenter", e => {
+    e.preventDefault();
+    if (!dragHasFiles(e)) return;
+    depth++;
+    $overlay.classList.add("visible");
+  });
+  document.addEventListener("dragleave", e => {
+    e.preventDefault();
+    if (!dragHasFiles(e)) return;
+    depth = Math.max(depth - 1, 0);
+    if (depth === 0) hideOverlay();
+  });
+  document.addEventListener("dragover", e => {
+    e.preventDefault();
+    // only files can be dropped here: show "not allowed" for anything else
+    if (e.dataTransfer) e.dataTransfer.dropEffect = dragHasFiles(e) ? "copy" : "none";
+  });
+  document.addEventListener("dragend", hideOverlay);
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") hideOverlay();
   });
   document.addEventListener("drop", e => {
+    e.preventDefault();
+    hideOverlay();
     // DataTransferItem entries are only valid during the event dispatch, so
     // everything below must run synchronously.
     const items = Array.from(e.dataTransfer.items).filter(item => item.kind === "file");
     if (items.length === 0) return;
+    announce(`Dropped ${items.length === 1 ? "1 item" : `${items.length} items`} to upload to ${DATA.href}`);
     if (typeof items[0].webkitGetAsEntry !== "function") {
       let skippedFolder = false;
       for (const item of items) {
