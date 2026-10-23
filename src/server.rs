@@ -41,8 +41,8 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
-use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::{fs, io};
 
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -60,7 +60,10 @@ const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
-const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
+const PART_FILE_INFIX: &str = ".dufs-";
+const PART_FILE_SUFFIX: &str = ".part";
+const PART_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const PART_FILE_NAME_MAX_LEN: usize = 200;
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 
@@ -274,6 +277,12 @@ impl Server {
         };
 
         let path = path.as_path();
+
+        if has_part_file_component(&relative_path) {
+            self.handle_not_found(&query_params, head_only, &mut res)
+                .await?;
+            return Ok(res);
+        }
 
         let (is_miss, is_dir, is_file, size) = match fs::metadata(path).await.ok() {
             Some(meta) => (false, meta.is_dir(), meta.is_file(), meta.len()),
@@ -565,36 +574,28 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         ensure_path_parent(path).await?;
-        let (mut file, status) = match upload_offset {
-            None => (fs::File::create(path).await?, StatusCode::CREATED),
-            Some(offset) if offset == size => (
-                fs::OpenOptions::new().append(true).open(path).await?,
-                StatusCode::NO_CONTENT,
-            ),
-            Some(offset) => {
-                let mut file = fs::OpenOptions::new().write(true).open(path).await?;
-                file.seek(SeekFrom::Start(offset)).await?;
-                (file, StatusCode::NO_CONTENT)
-            }
-        };
         let stream = IncomingStream::new(req.into_body());
-
         let body_with_io_error = stream.map_err(io::Error::other);
         let body_reader = StreamReader::new(body_with_io_error);
-
         pin_mut!(body_reader);
 
-        let ret = io::copy(&mut body_reader, &mut file).await;
-        let size = fs::metadata(path)
-            .await
-            .map(|v| v.len())
-            .unwrap_or_default();
-        if ret.is_err() {
-            if upload_offset.is_none() && size < RESUMABLE_UPLOAD_MIN_SIZE {
-                let _ = tokio::fs::remove_file(&path).await;
+        let status = match upload_offset {
+            None => {
+                write_atomic(path, &mut body_reader).await?;
+                StatusCode::CREATED
             }
-            ret?;
-        }
+            Some(offset) => {
+                let mut file = if offset == size {
+                    fs::OpenOptions::new().append(true).open(path).await?
+                } else {
+                    let mut file = fs::OpenOptions::new().write(true).open(path).await?;
+                    file.seek(SeekFrom::Start(offset)).await?;
+                    file
+                };
+                io::copy(&mut body_reader, &mut file).await?;
+                StatusCode::NO_CONTENT
+            }
+        };
 
         *res.status_mut() = status;
 
@@ -1579,6 +1580,11 @@ impl Server {
             }
         };
 
+        if has_part_file_component(&dest_path) {
+            DufsErrorCode::InvalidDestination.respond(res);
+            return None;
+        }
+
         let dest = match self.join_path(&dest_path) {
             Some(dest) => dest,
             None => {
@@ -1930,6 +1936,98 @@ fn normalize_path<P: AsRef<Path>>(path: P) -> String {
     }
 }
 
+/// Removes the upload's temp file unless the upload completed. Runs on drop so
+/// that a client disconnect, which drops the request future mid-copy, cleans up
+/// as well as an I/O error does.
+struct PartFileGuard(Option<PathBuf>);
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Writes `reader` to a temp file next to `path` and renames it over `path`
+/// once complete, so the target is either the old or the new content, never a
+/// partial or mixed one.
+async fn write_atomic<R: AsyncRead + Unpin>(path: &Path, reader: &mut R) -> io::Result<()> {
+    // Write through a symlink, as opening the path directly would.
+    let is_symlink = fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|v| v.is_symlink());
+    let target = if is_symlink {
+        fs::canonicalize(path).await?
+    } else {
+        path.to_path_buf()
+    };
+    let part = match (target.parent(), target.file_name()) {
+        (Some(dir), Some(name)) => dir.join(part_file_name(&name.to_string_lossy())),
+        _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .await?;
+    let mut guard = PartFileGuard(Some(part.clone()));
+    io::copy(reader, &mut file).await?;
+    file.flush().await?;
+    file.sync_data().await?;
+    drop(file);
+    if let Ok(meta) = fs::metadata(&target).await {
+        fs::set_permissions(&part, meta.permissions()).await?;
+    }
+    fs::rename(&part, &target).await?;
+    guard.0 = None;
+    Ok(())
+}
+
+fn part_file_name(name: &str) -> String {
+    let mut end = name.len().min(PART_FILE_NAME_MAX_LEN);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        ".{}{PART_FILE_INFIX}{}{PART_FILE_SUFFIX}",
+        &name[..end],
+        Uuid::new_v4().simple()
+    )
+}
+
+/// Whether `name` is the temp file of an in-progress upload.
+fn is_part_file(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|v| v.strip_suffix(PART_FILE_SUFFIX))
+        .and_then(|v| v.rsplit_once(PART_FILE_INFIX))
+        .is_some_and(|(_, id)| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn has_part_file_component(path: &str) -> bool {
+    path.split('/').any(is_part_file)
+}
+
+/// Removes upload temp files left behind by a crash or kill, once they are old
+/// enough that no running upload can still own them.
+pub fn remove_stale_part_files(root: &Path) {
+    let now = SystemTime::now();
+    for entry in WalkDir::new(root).into_iter().filter_map(|v| v.ok()) {
+        if !entry.file_type().is_file() || !is_part_file(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|v| v.modified().ok())
+            .and_then(|v| now.duration_since(v).ok())
+            .is_some_and(|age| age > PART_FILE_MAX_AGE);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            warn!("Removed stale upload file `{}`", entry.path().display());
+        }
+    }
+}
+
 async fn ensure_path_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if fs::symlink_metadata(parent).await.is_err() {
@@ -2073,14 +2171,15 @@ fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> 
 }
 
 fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
-    hidden.iter().any(|v| {
-        if is_dir {
-            if let Some(x) = v.strip_suffix('/') {
-                return glob(x, file_name);
+    is_part_file(file_name)
+        || hidden.iter().any(|v| {
+            if is_dir {
+                if let Some(x) = v.strip_suffix('/') {
+                    return glob(x, file_name);
+                }
             }
-        }
-        glob(v, file_name)
-    })
+            glob(v, file_name)
+        })
 }
 
 fn set_webdav_headers(res: &mut Response) {

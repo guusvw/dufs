@@ -209,7 +209,9 @@ Resumable downloads
 curl -C- -o file http://127.0.0.1:5000/file
 ```
 
-Resumable uploads
+Uploads with `PUT` are atomic: the body is written to a hidden `.<name>.dufs-<id>.part` file next to the target and renamed over it once complete, so an interrupted upload leaves the existing file untouched (and nothing behind for a new one). Leftover `.part` files older than 24 hours are removed at startup.
+
+Resumable uploads (`PATCH` appends to a file that already exists)
 
 ```sh
 upload_offset=$(curl -I -s http://127.0.0.1:5000/file | tr -d '\r' | sed -n 's/content-length: //p')
