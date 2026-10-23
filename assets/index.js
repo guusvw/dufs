@@ -1411,9 +1411,11 @@ async function setupEditorPage() {
     const url = baseUrl();
     const ext = extName(baseName(url)).toLowerCase();
     if (IFRAME_FORMATS.includes(ext)) {
+      // No sandbox attribute: Chromium refuses to render PDFs in a sandboxed
+      // iframe. The server sends `Content-Security-Policy: sandbox` on every
+      // file response, which gives the same isolation and lets PDFs load.
       const $preview = document.createElement("iframe");
       $preview.className = "preview";
-      $preview.setAttribute("sandbox", "");
       $preview.setAttribute("title", `Preview of ${baseName(url)}`);
       $preview.setAttribute("src", url);
       $notEditable.after($preview);

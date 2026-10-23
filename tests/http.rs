@@ -301,7 +301,7 @@ fn get_file_emoji_path(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("content-disposition").unwrap(),
-        "inline; filename=\"😀.bin\"; filename*=UTF-8''%F0%9F%98%80.bin"
+        "inline; filename=\"_.bin\"; filename*=UTF-8''%F0%9F%98%80.bin"
     );
     Ok(())
 }
@@ -313,7 +313,7 @@ fn get_file_newline_path(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("content-disposition").unwrap(),
-        "inline; filename=\"file 1.txt\""
+        "inline; filename=\"file 1.txt\"; filename*=UTF-8''file%0A1.txt"
     );
     Ok(())
 }
@@ -333,6 +333,107 @@ fn get_file_edit_bin(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 200);
     let editable = retrieve_edit_file(&resp.text().unwrap()).unwrap();
     assert!(!editable);
+    Ok(())
+}
+
+const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'";
+
+#[rstest]
+fn ui_pages_have_csp(server: TestServer) -> Result<(), Error> {
+    for url in [
+        server.url().to_string(),
+        format!("{}?noscript", server.url()),
+        format!("{}index.html?edit", server.url()),
+        format!("{}index.html?view", server.url()),
+    ] {
+        let resp = fetch!(b"GET", &url).send()?;
+        assert_eq!(resp.status(), 200, "{url}");
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            UI_CSP,
+            "{url}"
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+fn file_responses_are_sandboxed(server: TestServer) -> Result<(), Error> {
+    for name in ["test.html", "test.txt", BIN_FILE] {
+        let resp = fetch!(b"GET", format!("{}{name}", server.url())).send()?;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            "sandbox"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+    let resp = fetch!(b"HEAD", format!("{}test.html", server.url())).send()?;
+    assert_eq!(
+        resp.headers().get("content-security-policy").unwrap(),
+        "sandbox"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[rstest]
+fn content_disposition_escapes_quotes(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let url = format!(
+        "{}{}",
+        server.url(),
+        "q%22%3B%20filename%2A%3DUTF-8%27%27evil.exe%3B%20x%3D%22.txt"
+    );
+    let resp = fetch!(b"PUT", &url).body("x").send()?;
+    assert!(resp.status().is_success());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(resp.status(), 200);
+    let value = resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()?
+        .to_string();
+    // Split on `;` outside quotes: that is how a client reads the parameters.
+    let mut params = vec![];
+    let (mut quoted, mut current) = (false, String::new());
+    for ch in value.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            ';' if !quoted => params.push(std::mem::take(&mut current)),
+            ch => current.push(ch),
+        }
+    }
+    params.push(current);
+    let params: Vec<&str> = params.iter().map(|v| v.trim()).collect();
+    assert_eq!(
+        params,
+        [
+            "inline",
+            "filename=\"q_; filename*=UTF-8''evil.exe; x=_.txt\"",
+            "filename*=UTF-8''q%22%3B%20filename%2A%3DUTF-8%27%27evil.exe%3B%20x%3D%22.txt",
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[rstest]
+fn content_disposition_backslash(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let url = format!("{}a%5Cb.txt", server.url());
+    let resp = fetch!(b"PUT", &url).body("x").send()?;
+    assert!(resp.status().is_success());
+    let resp = fetch!(b"GET", &url).send()?;
+    assert_eq!(
+        resp.headers().get("content-disposition").unwrap(),
+        "inline; filename=\"a_b.txt\"; filename*=UTF-8''a%5Cb.txt"
+    );
     Ok(())
 }
 

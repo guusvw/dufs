@@ -26,7 +26,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, IF_MATCH, IF_UNMODIFIED_SINCE, RANGE,
+        CONTENT_SECURITY_POLICY, CONTENT_TYPE, IF_MATCH, IF_UNMODIFIED_SINCE, RANGE,
     },
     Method, StatusCode, Uri,
 };
@@ -57,6 +57,7 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
 const INDEX_JS: &str = include_str!("../assets/index.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'";
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
@@ -1010,6 +1011,7 @@ impl Server {
         let output = self.render_html(&html);
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        set_ui_csp(res);
         res.headers_mut()
             .typed_insert(ContentLength(output.len() as u64));
         res.headers_mut()
@@ -1179,6 +1181,14 @@ impl Server {
 
         let filename = try_get_file_name(path)?;
         set_content_disposition(res, true, filename)?;
+        // User files share the UI origin: sandbox them so served HTML/SVG
+        // cannot script the dufs origin, and forbid MIME sniffing.
+        res.headers_mut()
+            .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+        res.headers_mut().insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
 
         res.headers_mut().typed_insert(AcceptRanges::bytes());
 
@@ -1319,6 +1329,7 @@ impl Server {
         };
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        set_ui_csp(res);
         let index_data = STANDARD.encode(serde_json::to_string(&data)?);
         let output = self
             .render_html(&self.html)
@@ -1619,10 +1630,12 @@ impl Server {
         } else if has_query_flag(query_params, "noscript") {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+            set_ui_csp(res);
             generate_noscript_html(&data)?
         } else {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+            set_ui_csp(res);
 
             let index_data = STANDARD.encode(serde_json::to_string(&data)?);
             self.render_html(&self.html)
@@ -2396,27 +2409,29 @@ fn insert_upload_offset(res: &mut Response, received: u64) {
 
 fn set_content_disposition(res: &mut Response, inline: bool, filename: &str) -> Result<()> {
     let kind = if inline { "inline" } else { "attachment" };
-    let filename: String = filename
+    // The quoted `filename` is only an ASCII fallback; `"` and `\` would let a
+    // crafted name end the parameter and inject further ones.
+    let fallback: String = filename
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_control() && ch != '\t' {
-                ' '
-            } else {
-                ch
-            }
+        .map(|ch| match ch {
+            '"' | '\\' => '_',
+            ch if ch.is_ascii_control() && ch != '\t' => ' ',
+            ch if !ch.is_ascii() => '_',
+            ch => ch,
         })
         .collect();
-    let value = if filename.is_ascii() {
-        HeaderValue::from_str(&format!("{kind}; filename=\"{filename}\"",))?
-    } else {
-        HeaderValue::from_str(&format!(
-            "{kind}; filename=\"{}\"; filename*=UTF-8''{}",
-            filename,
-            encode_uri(&filename),
-        ))?
-    };
+    let value = HeaderValue::from_str(&format!(
+        "{kind}; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        urlencoding::encode(filename),
+    ))?;
     res.headers_mut().insert(CONTENT_DISPOSITION, value);
     Ok(())
+}
+
+/// Locks down the dufs UI pages: only same-origin script and style, no plugins.
+fn set_ui_csp(res: &mut Response) {
+    res.headers_mut()
+        .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(UI_CSP));
 }
 
 fn is_hidden(hidden: &[String], file_name: &str, is_dir: bool) -> bool {
