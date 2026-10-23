@@ -281,7 +281,7 @@ class Uploader {
             } else if (code === "readonly-descendant") {
               this.fail("directory contains read-only entries");
             } else {
-              this.fail(`${ajax.status} ${ajax.statusText}`);
+              this.fail(ioErrorReason(code) || `${ajax.status} ${ajax.statusText}`);
             }
           }
         }
@@ -862,7 +862,7 @@ async function doDeletePath(name, url, cb) {
     } else if (err.code === "delete-disabled") {
       alert(`Cannot delete \`${name}\`: delete is disabled`);
     } else {
-      alert(`Cannot delete \`${name}\`, ${err.message}`);
+      alert(`Cannot delete \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -919,7 +919,7 @@ async function doMovePath(fileUrl) {
     } else if (err.code === "upload-disabled" || err.code === "delete-disabled") {
       alert(`Cannot move \`${filePath}\`: moving is disabled`);
     } else {
-      alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+      alert(`Cannot move \`${filePath}\` to \`${newPath}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -936,7 +936,7 @@ async function saveChange() {
     });
     location.reload();
   } catch (err) {
-    alert(`Failed to save file, ${err.message}`);
+    alert(`Failed to save file, ${ioErrorReason(err.code) || err.message}`);
   }
 }
 
@@ -982,7 +982,7 @@ async function createFolder(name) {
     } else if (err.code === "upload-disabled") {
       alert(`Cannot create folder \`${name}\`: upload is disabled`);
     } else {
-      alert(`Cannot create folder \`${name}\`, ${err.message}`);
+      alert(`Cannot create folder \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -1003,7 +1003,7 @@ async function createFile(name) {
     } else if (err.code === "delete-disabled") {
       alert(`Cannot create file \`${name}\`: delete is disabled`);
     } else {
-      alert(`Cannot create file \`${name}\`, ${err.message}`);
+      alert(`Cannot create file \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -1122,6 +1122,20 @@ function encodedStr(rawStr) {
   return rawStr.replace(/[\u00A0-\u9999<>\&]/g, function (i) {
     return '&#' + i.charCodeAt(0) + ';';
   });
+}
+
+/**
+ * Short reason for an error code caused by a file system failure on the server
+ * @param {string|null} code value of the x-dufs-error-code header
+ * @returns {string|undefined}
+ */
+function ioErrorReason(code) {
+  switch (code) {
+    case "permission-denied": return "permission denied by the server file system";
+    case "conflict": return "a parent path is not a directory or the target already exists";
+    case "is-a-directory": return "the target is a directory";
+    case "insufficient-storage": return "the server is out of storage space";
+  }
 }
 
 async function assertResOK(res) {

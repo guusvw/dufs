@@ -3,6 +3,7 @@ use crate::server::Response;
 
 use hyper::header::HeaderValue;
 use hyper::StatusCode;
+use std::io;
 
 /// Response header carrying the machine-readable error reason.
 pub const ERROR_CODE_HEADER: &str = "x-dufs-error-code";
@@ -26,17 +27,23 @@ pub enum DufsErrorCode {
     UploadDisabled,
     DeleteDisabled,
     HashDisabled,
-    IsADirectory,
-    InternalError,
+    PermissionDenied,
     // 404
     ArchiveDisabled,
     // 405
     MissingUploadOffset,
     AlreadyExists,
     MethodNotAllowed,
+    // 409
+    Conflict,
+    IsADirectory,
     // 412
     PreconditionFailed,
     DestinationExists,
+    // 500
+    InternalError,
+    // 507
+    InsufficientStorage,
 }
 
 impl DufsErrorCode {
@@ -53,14 +60,17 @@ impl DufsErrorCode {
             UploadDisabled => "upload-disabled",
             DeleteDisabled => "delete-disabled",
             HashDisabled => "hash-disabled",
-            IsADirectory => "is-a-directory",
-            InternalError => "internal-error",
+            PermissionDenied => "permission-denied",
             ArchiveDisabled => "archive-disabled",
             MissingUploadOffset => "missing-upload-offset",
             AlreadyExists => "already-exists",
             MethodNotAllowed => "method-not-allowed",
             PreconditionFailed => "precondition-failed",
             DestinationExists => "destination-exists",
+            Conflict => "conflict",
+            IsADirectory => "is-a-directory",
+            InternalError => "internal-error",
+            InsufficientStorage => "insufficient-storage",
         }
     }
 
@@ -71,12 +81,15 @@ impl DufsErrorCode {
                 StatusCode::BAD_REQUEST
             }
             Forbidden | ReadonlyDescendant | UploadDisabled | DeleteDisabled | HashDisabled
-            | IsADirectory | InternalError => StatusCode::FORBIDDEN,
+            | PermissionDenied => StatusCode::FORBIDDEN,
             ArchiveDisabled => StatusCode::NOT_FOUND,
             MissingUploadOffset | AlreadyExists | MethodNotAllowed => {
                 StatusCode::METHOD_NOT_ALLOWED
             }
+            Conflict | IsADirectory => StatusCode::CONFLICT,
             PreconditionFailed | DestinationExists => StatusCode::PRECONDITION_FAILED,
+            InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -93,12 +106,29 @@ impl DufsErrorCode {
             UploadDisabled => "Forbidden: upload is disabled",
             DeleteDisabled => "Forbidden: delete is disabled",
             HashDisabled => "Forbidden: hash is disabled",
-            IsADirectory => "Forbidden: target is a directory",
-            InternalError => "Forbidden: failed to access the directory",
+            PermissionDenied => "Forbidden: permission denied by the file system",
             ArchiveDisabled => "Not Found",
             MissingUploadOffset => "",
             AlreadyExists => "Already exists",
             MethodNotAllowed | PreconditionFailed | DestinationExists => "",
+            Conflict => "Conflict: a path component is not a directory or already exists",
+            IsADirectory => "Conflict: target is a directory",
+            InternalError => "Internal Server Error",
+            InsufficientStorage => "Insufficient Storage",
+        }
+    }
+
+    /// Error code for a file system error kind. `None` means the kind has no
+    /// dedicated code and is handled by [`respond_io_error`].
+    pub fn from_io_kind(kind: io::ErrorKind) -> Option<Self> {
+        match kind {
+            io::ErrorKind::PermissionDenied => Some(Self::PermissionDenied),
+            io::ErrorKind::NotADirectory | io::ErrorKind::AlreadyExists => Some(Self::Conflict),
+            io::ErrorKind::IsADirectory => Some(Self::IsADirectory),
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                Some(Self::InsufficientStorage)
+            }
+            _ => None,
         }
     }
 
@@ -119,6 +149,28 @@ impl DufsErrorCode {
     }
 }
 
+/// Write the response for an error returned by a request handler.
+///
+/// The first [`io::Error`] in the error chain decides: kinds with a dedicated
+/// [`DufsErrorCode`] get it, `NotFound` is a plain 404 and everything else a
+/// plain 500.
+pub fn respond_io_error(err: &anyhow::Error, res: &mut Response) {
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind);
+    match kind {
+        Some(io::ErrorKind::NotFound) => {
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            *res.body_mut() = body_full("Not Found");
+        }
+        Some(kind) => DufsErrorCode::from_io_kind(kind)
+            .unwrap_or(DufsErrorCode::InternalError)
+            .respond(res),
+        None => DufsErrorCode::InternalError.respond(res),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,7 +178,7 @@ mod tests {
     #[test]
     fn codes_are_unique() {
         use DufsErrorCode::*;
-        const ALL: [DufsErrorCode; 17] = [
+        const ALL: [DufsErrorCode; 20] = [
             InvalidPath,
             InvalidUploadOffset,
             InvalidDepth,
@@ -136,14 +188,17 @@ mod tests {
             UploadDisabled,
             DeleteDisabled,
             HashDisabled,
-            IsADirectory,
-            InternalError,
+            PermissionDenied,
             ArchiveDisabled,
             MissingUploadOffset,
             AlreadyExists,
             MethodNotAllowed,
+            Conflict,
+            IsADirectory,
             PreconditionFailed,
             DestinationExists,
+            InternalError,
+            InsufficientStorage,
         ];
         let mut codes = std::collections::HashSet::new();
         for code in ALL {

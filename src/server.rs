@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
-use crate::error::DufsErrorCode;
+use crate::error::{respond_io_error, DufsErrorCode};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
@@ -127,9 +127,8 @@ impl Server {
             }
             Err(err) => {
                 let mut res = Response::default();
-                let status = StatusCode::INTERNAL_SERVER_ERROR;
-                *res.status_mut() = status;
-                http_log_data.insert("status".to_string(), status.as_u16().to_string());
+                respond_io_error(&err, &mut res);
+                http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 self.args
                     .http_logger
                     .log(&http_log_data, Some(err.to_string()));
@@ -635,8 +634,8 @@ impl Server {
         if !head_only && exist {
             paths = match self.list_dir(path, path, &access_paths).await {
                 Ok(paths) => paths,
-                Err(_) => {
-                    DufsErrorCode::InternalError.respond(res);
+                Err(err) => {
+                    respond_io_error(&err, res);
                     return Ok(());
                 }
             }
@@ -1273,8 +1272,8 @@ impl Server {
                 .await
             {
                 Ok(child) => paths.extend(child),
-                Err(_) => {
-                    DufsErrorCode::InternalError.respond(res);
+                Err(err) => {
+                    respond_io_error(&err, res);
                     return Ok(());
                 }
             }
