@@ -965,7 +965,14 @@ impl Server {
         } else if req_path == HEALTH_CHECK_PATH {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
-            let body = r#"{"status":"OK"}"#;
+            // `running` is cleared when the server starts draining, so load
+            // balancers stop routing here.
+            let body = if self.running.load(atomic::Ordering::SeqCst) {
+                r#"{"status":"OK"}"#
+            } else {
+                *res.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                r#"{"status":"shutting down"}"#
+            };
             res.headers_mut()
                 .typed_insert(ContentLength(body.len() as u64));
             if !head_only {

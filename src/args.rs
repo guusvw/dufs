@@ -224,6 +224,15 @@ pub fn build_cli() -> Command {
                 .help("Set zip compress level [default: low]")
         )
         .arg(
+            Arg::new("shutdown-timeout")
+                .env("DUFS_SHUTDOWN_TIMEOUT")
+                .hide_env(true)
+                .long("shutdown-timeout")
+                .value_name("seconds")
+                .value_parser(value_parser!(u64))
+                .help("Seconds to wait for in-flight requests on SIGINT/SIGTERM before aborting them [default: 10]"),
+        )
+        .arg(
             Arg::new("completions")
                 .long("completions")
                 .value_name("shell")
@@ -301,6 +310,9 @@ pub struct Args {
     pub http_logger: HttpLogger,
     pub log_file: Option<PathBuf>,
     pub compress: Compress,
+    #[serde(default = "default_shutdown_timeout")]
+    #[default(default_shutdown_timeout())]
+    pub shutdown_timeout: u64,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -428,6 +440,10 @@ impl Args {
 
         if let Some(compress) = matches.get_one::<Compress>("compress") {
             args.compress = *compress;
+        }
+
+        if let Some(shutdown_timeout) = matches.get_one::<u64>("shutdown-timeout") {
+            args.shutdown_timeout = *shutdown_timeout;
         }
 
         #[cfg(feature = "tls")]
@@ -643,6 +659,10 @@ fn default_addrs() -> Vec<BindAddr> {
 
 fn default_port() -> u16 {
     5000
+}
+
+fn default_shutdown_timeout() -> u64 {
+    10
 }
 
 #[cfg(test)]

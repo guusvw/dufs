@@ -24,21 +24,34 @@ use futures_util::future::join_all;
 use hyper::{body::Incoming, service::service_fn, Request};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
+    server::{
+        conn::auto::Builder,
+        graceful::{GracefulShutdown, Watcher},
+    },
 };
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
+use std::pin::pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
 use tokio::{net::TcpListener, task::JoinHandle};
 #[cfg(feature = "tls")]
 use tokio_rustls::{
     rustls::{crypto::ring, ServerConfig},
     TlsAcceptor,
 };
+use tokio_util::sync::CancellationToken;
+
+/// Delay after the first failed `accept()`, doubled on each further failure.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,26 +68,171 @@ async fn main() -> Result<()> {
     args.addrs = new_addrs;
     let running = Arc::new(AtomicBool::new(true));
     let listening = print_listening(&args, &print_addrs)?;
-    let handles = serve(args, running.clone())?;
+    let shutdown_timeout = Duration::from_secs(args.shutdown_timeout);
+    let shutdown = Shutdown::default();
+    let handles = serve(args, running.clone(), shutdown.clone())?;
     println!("{listening}");
 
+    let mut serving = pin!(join_all(handles));
     tokio::select! {
-        ret = join_all(handles) => {
+        ret = &mut serving => {
             for r in ret {
                 if let Err(e) = r {
                     error!("{e}");
                 }
             }
-            Ok(())
         },
         _ = shutdown_signal() => {
+            // The health check starts answering 503 and walks stop early.
             running.store(false, Ordering::SeqCst);
-            Ok(())
+            shutdown.drain.cancel();
+            info!(
+                "Shutting down, waiting up to {}s for in-flight requests",
+                shutdown_timeout.as_secs()
+            );
+            if timeout(shutdown_timeout, &mut serving).await.is_err() {
+                warn!("Shutdown timeout reached, aborting remaining requests");
+                shutdown.abort.cancel();
+                serving.await;
+            }
         },
+    }
+    Ok(())
+}
+
+/// Signals sent to the accept loops when the process is asked to stop.
+#[derive(Clone, Default)]
+struct Shutdown {
+    /// Stop accepting and let open connections finish their current request.
+    drain: CancellationToken,
+    /// Drop the connections that are still open.
+    abort: CancellationToken,
+}
+
+/// Back-off between failed `accept()` calls, e.g. while out of file descriptors.
+#[derive(Default)]
+struct AcceptBackoff {
+    delay: Option<Duration>,
+}
+
+impl AcceptBackoff {
+    /// Delay to wait before the next `accept()` after a failure.
+    fn next_delay(&mut self) -> Duration {
+        let delay = self
+            .delay
+            .map_or(ACCEPT_BACKOFF_MIN, |d| (d * 2).min(ACCEPT_BACKOFF_MAX));
+        self.delay = Some(delay);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.delay = None;
+    }
+
+    /// Log the failure (once per burst) and sleep. Returns `false` if the
+    /// drain was requested meanwhile.
+    async fn wait(&mut self, err: &io::Error, drain: &CancellationToken) -> bool {
+        if self.delay.is_none() {
+            error!("Failed to accept connection, {err}");
+        }
+        let delay = self.next_delay();
+        tokio::select! {
+            _ = drain.cancelled() => false,
+            _ = sleep(delay) => true,
+        }
     }
 }
 
-fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
+trait Listener: Send + 'static {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+
+    /// Wait for the next connection. `Ok(None)` is a connection that was
+    /// dropped before it became usable, e.g. a failed TLS handshake.
+    fn accept(
+        &self,
+    ) -> impl Future<Output = io::Result<Option<(Self::Stream, Option<SocketAddr>)>>> + Send;
+}
+
+impl Listener for TcpListener {
+    type Stream = tokio::net::TcpStream;
+
+    async fn accept(&self) -> io::Result<Option<(Self::Stream, Option<SocketAddr>)>> {
+        let (stream, addr) = TcpListener::accept(self).await?;
+        Ok(Some((stream, Some(addr))))
+    }
+}
+
+#[cfg(feature = "tls")]
+struct TlsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+#[cfg(feature = "tls")]
+impl Listener for TlsListener {
+    type Stream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+    async fn accept(&self) -> io::Result<Option<(Self::Stream, Option<SocketAddr>)>> {
+        let handshake_timeout = Duration::from_secs(10);
+        let (stream, addr) = self.listener.accept().await?;
+        Ok(timeout(handshake_timeout, self.acceptor.accept(stream))
+            .await
+            .ok()
+            .and_then(|v| v.ok())
+            .map(|stream| (stream, Some(addr))))
+    }
+}
+
+#[cfg(unix)]
+impl Listener for tokio::net::UnixListener {
+    type Stream = tokio::net::UnixStream;
+
+    async fn accept(&self) -> io::Result<Option<(Self::Stream, Option<SocketAddr>)>> {
+        let (stream, _addr) = tokio::net::UnixListener::accept(self).await?;
+        Ok(Some((stream, None)))
+    }
+}
+
+/// Accept connections until the drain is requested, then wait for the open
+/// ones to finish. Connections are dropped as soon as the abort is requested.
+async fn accept_loop<L: Listener>(listener: L, server: Arc<Server>, shutdown: Shutdown) {
+    let graceful = GracefulShutdown::new();
+    let mut conns = JoinSet::new();
+    let mut backoff = AcceptBackoff::default();
+    loop {
+        tokio::select! {
+            _ = shutdown.drain.cancelled() => break,
+            // Reap finished connections so the set doesn't grow forever.
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            ret = listener.accept() => match ret {
+                Ok(accepted) => {
+                    backoff.reset();
+                    if let Some((stream, addr)) = accepted {
+                        conns.spawn(handle_stream(
+                            server.clone(),
+                            TokioIo::new(stream),
+                            addr,
+                            graceful.watcher(),
+                        ));
+                    }
+                }
+                Err(err) => {
+                    if !backoff.wait(&err, &shutdown.drain).await {
+                        break;
+                    }
+                }
+            },
+        }
+    }
+    // Refuse new connections instead of leaving them in the backlog.
+    drop(listener);
+    tokio::select! {
+        _ = graceful.shutdown() => {}
+        _ = shutdown.abort.cancelled() => conns.shutdown().await,
+    }
+}
+
+fn serve(args: Args, running: Arc<AtomicBool>, shutdown: Shutdown) -> Result<Vec<JoinHandle<()>>> {
     let addrs = args.addrs.clone();
     let port = args.port;
     let tls_config = (args.tls_cert.clone(), args.tls_key.clone());
@@ -82,6 +240,7 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = vec![];
     for bind_addr in addrs.iter() {
         let server_handle = server_handle.clone();
+        let shutdown = shutdown.clone();
         match bind_addr {
             BindAddr::IpAddr(ip) => {
                 let listener = create_listener(SocketAddr::new(*ip, port))
@@ -102,48 +261,15 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                                 .with_single_cert(certs, key)?;
                         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                         let config = Arc::new(config);
-                        let tls_accepter = TlsAcceptor::from(config);
-                        let handshake_timeout = Duration::from_secs(10);
+                        let listener = TlsListener {
+                            listener,
+                            acceptor: TlsAcceptor::from(config),
+                        };
 
-                        let handle = tokio::spawn(async move {
-                            loop {
-                                let Ok((stream, addr)) = listener.accept().await else {
-                                    continue;
-                                };
-                                let Some(stream) =
-                                    timeout(handshake_timeout, tls_accepter.accept(stream))
-                                        .await
-                                        .ok()
-                                        .and_then(|v| v.ok())
-                                else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
-                            }
-                        });
-
-                        handles.push(handle);
+                        handles.push(tokio::spawn(accept_loop(listener, server_handle, shutdown)));
                     }
                     (None, None) => {
-                        let handle = tokio::spawn(async move {
-                            loop {
-                                let Ok((stream, addr)) = listener.accept().await else {
-                                    continue;
-                                };
-                                let stream = TokioIo::new(stream);
-                                tokio::spawn(handle_stream(
-                                    server_handle.clone(),
-                                    stream,
-                                    Some(addr),
-                                ));
-                            }
-                        });
-                        handles.push(handle);
+                        handles.push(tokio::spawn(accept_loop(listener, server_handle, shutdown)));
                     }
                     _ => {
                         bail!("tls-cert and tls-key must be set together")
@@ -165,35 +291,27 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
                 };
                 let listener = tokio::net::UnixListener::bind(socket_path)
                     .with_context(|| format!("Failed to bind `{path}`"))?;
-                let handle = tokio::spawn(async move {
-                    loop {
-                        let Ok((stream, _addr)) = listener.accept().await else {
-                            continue;
-                        };
-                        let stream = TokioIo::new(stream);
-                        tokio::spawn(handle_stream(server_handle.clone(), stream, None));
-                    }
-                });
-
-                handles.push(handle);
+                handles.push(tokio::spawn(accept_loop(listener, server_handle, shutdown)));
             }
         }
     }
     Ok(handles)
 }
 
-async fn handle_stream<T>(handle: Arc<Server>, stream: TokioIo<T>, addr: Option<SocketAddr>)
-where
+async fn handle_stream<T>(
+    handle: Arc<Server>,
+    stream: TokioIo<T>,
+    addr: Option<SocketAddr>,
+    watcher: Watcher,
+) where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let hyper_service =
         service_fn(move |request: Request<Incoming>| handle.clone().call(request, addr));
 
-    match Builder::new(TokioExecutor::new())
-        .title_case_headers(true)
-        .serve_connection_with_upgrades(stream, hyper_service)
-        .await
-    {
+    let builder = Builder::new(TokioExecutor::new()).title_case_headers(true);
+    let conn = builder.serve_connection_with_upgrades(stream, hyper_service);
+    match watcher.watch(conn).await {
         Ok(()) => {}
         Err(_err) => {
             // This error only appears when the client doesn't send a request and terminate the connection.
@@ -313,8 +431,43 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
     Ok(output)
 }
 
+/// Resolves when the process is asked to stop: SIGINT or SIGTERM on Unix,
+/// Ctrl+C elsewhere.
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (mut sigint, mut sigterm) = match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            (Ok(sigint), Ok(sigterm)) => (sigint, sigterm),
+            (Err(e), _) | (_, Err(e)) => {
+                error!("Failed to install signal handlers, {e}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     if let Err(e) = tokio::signal::ctrl_c().await {
         error!("Failed to install CTRL+C signal handler, {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_backoff_doubles_up_to_the_cap_and_resets() {
+        let mut backoff = AcceptBackoff::default();
+        let delays: Vec<_> = (0..9).map(|_| backoff.next_delay().as_millis()).collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), ACCEPT_BACKOFF_MIN);
     }
 }
