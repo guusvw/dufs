@@ -558,7 +558,8 @@ impl Server {
                     } else if is_miss {
                         status_not_found(&mut res);
                     } else {
-                        self.handle_copy(path, &req, &mut res).await?
+                        self.handle_copy(path, user.as_deref(), &req, &mut res)
+                            .await?
                     }
                 }
                 "MOVE" => {
@@ -571,7 +572,8 @@ impl Server {
                     } else if is_dir && Self::has_restricted_descendant(&access_paths) {
                         DufsErrorCode::ReadonlyDescendant.respond(&mut res);
                     } else {
-                        self.handle_move(path, &req, &mut res).await?
+                        self.handle_move(path, user.as_deref(), &req, &mut res)
+                            .await?
                     }
                 }
                 "LOCK" => {
@@ -1471,8 +1473,14 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_copy(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
+    async fn handle_copy(
+        &self,
+        path: &Path,
+        user: Option<&str>,
+        req: &Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let dest = match self.extract_dest(user, req, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1514,8 +1522,14 @@ impl Server {
         Ok(())
     }
 
-    async fn handle_move(&self, path: &Path, req: &Request, res: &mut Response) -> Result<()> {
-        let dest = match self.extract_dest(req, res).await {
+    async fn handle_move(
+        &self,
+        path: &Path,
+        user: Option<&str>,
+        req: &Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let dest = match self.extract_dest(user, req, res).await {
             Some(dest) => dest,
             None => {
                 return Ok(());
@@ -1712,7 +1726,15 @@ impl Server {
             .unwrap_or_default()
     }
 
-    async fn extract_dest(&self, req: &Request, res: &mut Response) -> Option<PathBuf> {
+    /// Resolve the `Destination` header of `COPY`/`MOVE` and check that the
+    /// already authenticated `user` may write there. Authentication is not
+    /// repeated: a Digest `Authorization` header can only be verified once.
+    async fn extract_dest(
+        &self,
+        user: Option<&str>,
+        req: &Request,
+        res: &mut Response,
+    ) -> Option<PathBuf> {
         let headers = req.headers();
         let dest_path = match self
             .extract_destination_header(headers)
@@ -1725,29 +1747,16 @@ impl Server {
             }
         };
 
-        let authorization = headers.get(AUTHORIZATION);
-        let request_target = req.uri().to_string();
-        let guard = self
+        let access = self
             .args
             .auth
-            .guard(
-                &dest_path,
-                req.method(),
-                &request_target,
-                authorization,
-                None,
-                false,
-                &self.args.serve_path,
-            )
+            .guard_authenticated(user, &dest_path, req.method(), &self.args.serve_path)
             .await;
 
-        match guard {
-            (_, Some(_), _, _) => {}
-            _ => {
-                DufsErrorCode::Forbidden.respond(res);
-                return None;
-            }
-        };
+        if access.is_none() {
+            DufsErrorCode::Forbidden.respond(res);
+            return None;
+        }
 
         if has_part_file_component(&dest_path) {
             DufsErrorCode::InvalidDestination.respond(res);
