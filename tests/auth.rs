@@ -366,7 +366,27 @@ fn no_auth_propfind_dir(
     assert_eq!(resp.status(), 207);
     let body = resp.text()?;
     assert!(body.contains("<D:href>/dir-assets/</D:href>"));
-    assert!(body.contains("<D:href>/dir1/</D:href>"));
+    assert!(!body.contains("<D:href>/dir1/</D:href>"));
+    assert!(!body.contains("<D:href>/test.html</D:href>"));
+    Ok(())
+}
+
+#[rstest]
+fn no_auth_propfind_root_only_configured_children(
+    #[with(&["--auth", "admin:admin@/:rw", "--auth", "@/dir-assets", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    // anonymous clients that probe the root still get a 207 (issue #229)
+    let resp = fetch!(b"PROPFIND", server.url())
+        .header("Depth", "0")
+        .send()?;
+    assert_eq!(resp.status(), 207);
+    assert!(resp.text()?.contains("<D:href>/</D:href>"));
+
+    let resp = fetch!(b"PROPFIND", server.url()).send()?;
+    assert_eq!(resp.status(), 207);
+    let body = resp.text()?;
+    assert!(body.contains("<D:href>/</D:href>"));
+    assert_eq!(body.matches("<D:href>").count(), 2);
     Ok(())
 }
 
