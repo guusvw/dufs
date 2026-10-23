@@ -268,7 +268,10 @@ class Uploader {
     this.url = newUrl(this.name);
   }
 
-  upload() {
+  /**
+   * Insert this upload's row into the uploaders table and bind its cells.
+   */
+  render() {
     const { idx, name, url } = this;
     const escapedName = escapeHtml(name);
     $uploadersTable.insertAdjacentHTML("beforeend", `
@@ -295,6 +298,10 @@ class Uploader {
     this.$status.textContent = "-";
     this.$percent.textContent = formatPercent(0);
     this.$size.textContent = formatUploadSize(0, this.file.size);
+  }
+
+  upload() {
+    this.render();
     this.$status.addEventListener("click", e => {
       const nodeId = e.target.id;
       const matches = /^retry(\d+)$/.exec(nodeId);
@@ -306,6 +313,23 @@ class Uploader {
     });
     Uploader.queues.push(this);
     Uploader.runQueue();
+  }
+
+  /**
+   * Show a failed row for an entry that could not be read, so it never
+   * enters the upload queue and offers no retry.
+   * @param {string} name entry name
+   * @param {string[]} pathParts parent directories
+   * @param {string} reason
+   */
+  static unreadable(name, pathParts, reason) {
+    const uploader = new Uploader(new File([], name), pathParts);
+    uploader.render();
+    const $reason = document.createElement("span");
+    $reason.setAttribute("title", reason);
+    $reason.textContent = "✗";
+    uploader.$status.replaceChildren($reason);
+    uploader.$size.textContent = reason;
   }
 
   ajax() {
@@ -859,19 +883,26 @@ function setupDropzone() {
       e.stopPropagation();
     });
   });
-  document.addEventListener("drop", async e => {
-    if (!e.dataTransfer.items[0].webkitGetAsEntry) {
-      const files = Array.from(e.dataTransfer.files).filter(v => v.size > 0);
-      for (const file of files) {
+  document.addEventListener("drop", e => {
+    // DataTransferItem entries are only valid during the event dispatch, so
+    // everything below must run synchronously.
+    const items = Array.from(e.dataTransfer.items).filter(item => item.kind === "file");
+    if (items.length === 0) return;
+    if (typeof items[0].webkitGetAsEntry !== "function") {
+      let skippedFolder = false;
+      for (const item of items) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        // browsers without the entries API report folders as empty, untyped files
+        if (file.size === 0 && file.type === "") {
+          skippedFolder = true;
+          continue;
+        }
         new Uploader(file, []).upload();
       }
+      if (skippedFolder) alert("Folders cannot be uploaded in this browser");
     } else {
-      const entries = [];
-      const len = e.dataTransfer.items.length;
-      for (let i = 0; i < len; i++) {
-        entries.push(e.dataTransfer.items[i].webkitGetAsEntry());
-      }
-      addFileEntries(entries, []);
+      addFileEntries(items.map(item => item.webkitGetAsEntry()).filter(entry => entry), []);
     }
   });
 }
@@ -1833,11 +1864,13 @@ async function createFile(name) {
   }
 }
 
-async function addFileEntries(entries, dirs) {
+function addFileEntries(entries, dirs) {
   for (const entry of entries) {
     if (entry.isFile) {
       entry.file(file => {
         new Uploader(file, dirs).upload();
+      }, err => {
+        Uploader.unreadable(entry.name, dirs, err.message || err.name);
       });
     } else if (entry.isDirectory) {
       const dirReader = entry.createReader();
@@ -1845,11 +1878,14 @@ async function addFileEntries(entries, dirs) {
       const successCallback = entries => {
         if (entries.length > 0) {
           addFileEntries(entries, [...dirs, entry.name]);
-          dirReader.readEntries(successCallback);
+          dirReader.readEntries(successCallback, errorCallback);
         }
       };
+      const errorCallback = err => {
+        Uploader.unreadable(entry.name, dirs, err.message || err.name);
+      };
 
-      dirReader.readEntries(successCallback);
+      dirReader.readEntries(successCallback, errorCallback);
     }
   }
 }
