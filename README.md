@@ -77,6 +77,7 @@ Options:
       --log-format <format>  Customize http log format
       --log-file <file>      Specify the file to save logs to, other than stdout/stderr
       --compress <level>     Set zip compress level [default: low] [possible values: none, low, medium, high]
+      --token-secret-file <path>  Path to the secret that signs share tokens, created if missing
       --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
       --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
       --tls-key <path>       Path to the SSL/TLS certificate's private key
@@ -281,6 +282,20 @@ Two important things for hashed passwords:
 1. Dufs only supports sha-512 hashed passwords, so ensure that the password string always starts with `$6$`.
 2. Digest authentication does not function properly with hashed passwords.
 
+#### Share Tokens
+
+`?tokengen` returns a token that grants access to one path for 3 days (this is what the web UI's share button uses). Tokens are signed with a key derived from a server-side secret and the user name, never from the password or its hash.
+
+By default the secret is random and lives only in memory, so every restart invalidates all issued tokens. To keep tokens valid across restarts, store the secret in a file:
+
+```sh
+dufs -a admin:admin@/:rw --token-secret-file token.secret
+```
+
+The file is created with mode `0600` and a random 32-byte secret (64 hex digits) if it does not exist. On Unix, dufs refuses to start if an existing file is accessible by other users. To use your own secret: `openssl rand -hex 32 > token.secret && chmod 600 token.secret`.
+
+To revoke all tokens, change the secret: delete the file (a new one is created at the next start) or replace its content, then restart. Changing a user's password does not revoke tokens.
+
 
 ### Hide Paths
 
@@ -377,6 +392,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --compress <compress>   DUFS_COMPRESS=low
     --tls-cert <path>       DUFS_TLS_CERT=cert.pem
     --tls-key <path>        DUFS_TLS_KEY=key.pem
+    --token-secret-file <path>  DUFS_TOKEN_SECRET_FILE=token.secret
 ```
 
 ## Configuration File
@@ -416,6 +432,7 @@ log-file: ./dufs.log
 compress: low
 tls-cert: tests/data/cert.pem
 tls-key: tests/data/key_pkcs1.pem
+token-secret-file: token.secret
 ```
 
 ### Customize UI

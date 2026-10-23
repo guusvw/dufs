@@ -616,6 +616,7 @@ dependencies = [
  "ed25519-dalek",
  "form_urlencoded",
  "futures-util",
+ "getrandom 0.4.3",
  "glob",
  "headers",
  "hex",

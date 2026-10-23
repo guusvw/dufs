@@ -9,7 +9,7 @@ use std::env;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use crate::auth::AccessControl;
+use crate::auth::{load_token_secret, AccessControl};
 use crate::http_logger::HttpLogger;
 use crate::utils::{encode_uri, is_ipv6_available};
 
@@ -233,6 +233,15 @@ pub fn build_cli() -> Command {
                 .help("Set zip compress level [default: low]")
         )
         .arg(
+            Arg::new("token-secret-file")
+                .env("DUFS_TOKEN_SECRET_FILE")
+                .hide_env(true)
+                .long("token-secret-file")
+                .value_name("path")
+                .value_parser(value_parser!(PathBuf))
+                .help("Path to the secret that signs share tokens, created if missing"),
+        )
+        .arg(
             Arg::new("completions")
                 .long("completions")
                 .value_name("shell")
@@ -315,6 +324,7 @@ pub struct Args {
     pub compress: Compress,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    pub token_secret_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -466,6 +476,13 @@ impl Args {
         {
             args.tls_cert = None;
             args.tls_key = None;
+        }
+
+        if let Some(path) = matches.get_one::<PathBuf>("token-secret-file") {
+            args.token_secret_file = Some(path.clone());
+        }
+        if let Some(path) = &args.token_secret_file {
+            args.auth.set_token_secret(load_token_secret(path)?);
         }
 
         Ok(args)
