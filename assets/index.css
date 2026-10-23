@@ -782,6 +782,38 @@ button.toolbox-right,
   font-style: italic;
 }
 
+/* The preview takes whatever the header leaves, so it needs no header height
+   to subtract (the header wraps to several lines on phones) and follows
+   rotation and dynamic browser toolbars: 100dvh tracks the visible viewport,
+   100vh is the fallback for browsers without dynamic viewport units. */
+body.previewing {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+}
+
+body.previewing .head {
+  flex: none;
+}
+
+body.previewing .main,
+body.previewing .editor-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  margin-bottom: 0.5em;
+  border: 1px solid var(--border-secondary);
+  border-radius: 4px;
+}
+
 .retry-btn,
 .cancel-btn {
   background: none;

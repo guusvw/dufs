@@ -43,9 +43,10 @@ const PARAMS = Object.fromEntries(new URLSearchParams(window.location.search).en
 
 const IFRAME_FORMATS = [
   ".pdf",
-  ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg",
+  ".jpg", ".jpeg", ".png", ".apng", ".gif", ".bmp", ".svg",
+  ".webp", ".avif", ".jxl", ".ico",
   ".mp4", ".mov", ".avi", ".wmv", ".flv", ".webm",
-  ".mp3", ".ogg", ".wav", ".m4a",
+  ".mp3", ".ogg", ".opus", ".flac", ".wav", ".m4a",
 ];
 
 const MAX_SUBPATHS_COUNT = 1000;
@@ -1324,12 +1325,26 @@ async function setupEditorPage() {
   if (!DATA.editable) {
     const $notEditable = document.querySelector(".not-editable");
     const url = baseUrl();
-    const ext = extName(baseName(url));
-    if (IFRAME_FORMATS.find(v => v === ext)) {
-      $notEditable.insertAdjacentHTML("afterend", `<iframe src="${escapeHtml(url)}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
+    const ext = extName(baseName(url)).toLowerCase();
+    if (IFRAME_FORMATS.includes(ext)) {
+      const $preview = document.createElement("iframe");
+      $preview.className = "preview";
+      $preview.setAttribute("sandbox", "");
+      $preview.setAttribute("title", `Preview of ${baseName(url)}`);
+      $preview.setAttribute("src", url);
+      $notEditable.after($preview);
+      document.body.classList.add("previewing");
     } else {
       $notEditable.classList.remove("hidden");
-      $notEditable.textContent = "Cannot edit because file is too large or binary.";
+      if (DATA.kind == "View") {
+        const $link = document.createElement("a");
+        $link.setAttribute("href", url);
+        $link.setAttribute("download", "");
+        $link.textContent = "Download";
+        $notEditable.replaceChildren("No preview available for this file type. ", $link);
+      } else {
+        $notEditable.textContent = "Cannot edit because file is too large or binary.";
+      }
     }
     return;
   }
