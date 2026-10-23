@@ -938,11 +938,12 @@ impl Server {
         res: &mut Response,
     ) -> Result<()> {
         let index_path = path.join(INDEX_NAME);
-        if fs::metadata(&index_path)
-            .await
-            .ok()
-            .map(|v| v.is_file())
-            .unwrap_or_default()
+        if !self.guard_root_contained(&index_path).await
+            && fs::metadata(&index_path)
+                .await
+                .ok()
+                .map(|v| v.is_file())
+                .unwrap_or_default()
         {
             self.handle_send_file(&index_path, headers, head_only, res)
                 .await?;
@@ -996,9 +997,9 @@ impl Server {
         head_only: bool,
         res: &mut Response,
     ) -> Result<()> {
-        if path.extension().is_none() {
-            let path = self.args.serve_path.join(INDEX_NAME);
-            self.handle_send_file(&path, headers, head_only, res)
+        let index_path = self.args.serve_path.join(INDEX_NAME);
+        if path.extension().is_none() && !self.guard_root_contained(&index_path).await {
+            self.handle_send_file(&index_path, headers, head_only, res)
                 .await?;
         } else {
             self.handle_not_found(query_params, head_only, res).await?;
