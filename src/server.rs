@@ -5,7 +5,8 @@ use crate::error::{respond_io_error, DufsErrorCode};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
 use crate::utils::{
-    decode_uri, encode_uri, get_file_name, glob, join_within, parse_range, try_get_file_name,
+    coalesce_ranges, decode_uri, encode_uri, get_file_name, glob, join_within, parse_range,
+    try_get_file_name,
 };
 use crate::Args;
 
@@ -60,7 +61,7 @@ const INDEX_JS: &str = include_str!("../assets/index.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'";
 const INDEX_NAME: &str = "index.html";
-const BUF_SIZE: usize = 65536;
+pub(crate) const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const PART_FILE_INFIX: &str = ".dufs-";
 const PART_FILE_SUFFIX: &str = ".part";
@@ -1253,9 +1254,20 @@ impl Server {
                     .to_str()
                     .ok()
                     .and_then(|range| parse_range(range, size))
+                    .map(|ranges| (ranges.len(), coalesce_ranges(ranges)))
             })
         } else {
             None
+        };
+        // Several ranges that together cover the whole file are served as a
+        // plain 200 instead of a multipart response.
+        let ranges = match ranges {
+            Some(Some((requested, merged)))
+                if requested > 1 && merged.as_slice() == [(0, size - 1)] =>
+            {
+                None
+            }
+            other => other.map(|ranges| ranges.map(|(_, merged)| merged)),
         };
 
         res.headers_mut().insert(
@@ -1603,6 +1615,16 @@ impl Server {
         }
 
         ensure_path_parent(&dest).await?;
+
+        let overwrite = req
+            .headers()
+            .get("overwrite")
+            .map(|v| v.as_bytes() != b"F")
+            .unwrap_or(true);
+        if !overwrite && fs::symlink_metadata(&dest).await.is_ok() {
+            DufsErrorCode::DestinationExists.respond(res);
+            return Ok(());
+        }
 
         fs::rename(path, &dest).await?;
 

@@ -195,6 +195,55 @@ fn move_file(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn move_overwrite_false(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let origin_url = format!("{}test.txt", server.url());
+    let dest_url = format!("{}test.html", server.url());
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &dest_url)
+        .header("Overwrite", "F")
+        .send()?;
+    assert_eq!(resp.status(), 412);
+    // neither file was touched
+    let resp = reqwest::blocking::get(dest_url)?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is test.html");
+    let resp = reqwest::blocking::get(origin_url)?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn move_overwrite_false_new_destination(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let origin_url = format!("{}test.html", server.url());
+    let new_url = format!("{}test2.html", server.url());
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &new_url)
+        .header("Overwrite", "F")
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    let resp = reqwest::blocking::get(new_url)?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn move_overwrite_true(#[with(&["-A"])] server: TestServer) -> Result<(), Error> {
+    let origin_url = format!("{}test.txt", server.url());
+    let dest_url = format!("{}test.html", server.url());
+    let resp = fetch!(b"MOVE", &origin_url)
+        .header("Destination", &dest_url)
+        .header("Overwrite", "T")
+        .send()?;
+    assert_eq!(resp.status(), 204);
+    let resp = reqwest::blocking::get(dest_url)?;
+    assert_eq!(resp.status(), 200);
+    assert_ne!(resp.text()?, "This is test.html");
+    let resp = reqwest::blocking::get(origin_url)?;
+    assert_eq!(resp.status(), 404);
+    Ok(())
+}
+
+#[rstest]
 fn move_not_allow_upload(#[with(&["--allow-delete"])] server: TestServer) -> Result<(), Error> {
     let origin_url = format!("{}test.html", server.url());
     let new_url = format!("{}test2.html", server.url());

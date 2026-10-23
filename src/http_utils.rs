@@ -9,6 +9,8 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio_util::io::poll_read_buf;
 
+use crate::server::BUF_SIZE;
+
 #[derive(Debug)]
 pub struct IncomingStream {
     inner: Incoming,
@@ -53,7 +55,7 @@ impl<R> LengthLimitedStream<R> {
             reader: Some(reader),
             remaining: limit,
             buf: BytesMut::new(),
-            capacity: 4096,
+            capacity: BUF_SIZE,
         }
     }
 }
