@@ -265,6 +265,12 @@ fn assets_override_not_found_page(tmpdir: TempDir, port: Port) -> Result<(), Err
     let url = format!("http://localhost:{port}/missing-path");
     let resp = reqwest::blocking::get(&url)?;
     assert_eq!(resp.status(), 404);
+    assert!(resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()?
+        .starts_with("default-src 'self'; script-src 'self'"));
     assert_eq!(resp.text()?, not_found_html);
 
     let url = format!("http://localhost:{port}/missing-path?noscript");
