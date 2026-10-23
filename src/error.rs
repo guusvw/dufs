@@ -3,6 +3,7 @@ use crate::server::Response;
 
 use hyper::header::HeaderValue;
 use hyper::StatusCode;
+use std::io;
 
 /// Response header carrying the machine-readable error reason.
 pub const ERROR_CODE_HEADER: &str = "x-dufs-error-code";
@@ -27,8 +28,7 @@ pub enum DufsErrorCode {
     UploadDisabled,
     DeleteDisabled,
     HashDisabled,
-    IsADirectory,
-    InternalError,
+    PermissionDenied,
     // 404
     ArchiveDisabled,
     UploadNotFound,
@@ -37,13 +37,19 @@ pub enum DufsErrorCode {
     AlreadyExists,
     MethodNotAllowed,
     // 409
+    Conflict,
+    IsADirectory,
     UploadIdInUse,
     UploadOffsetMismatch,
     // 412
     PreconditionFailed,
     DestinationExists,
+    // 500
+    InternalError,
     // 503
     Busy,
+    // 507
+    InsufficientStorage,
 }
 
 impl DufsErrorCode {
@@ -61,8 +67,7 @@ impl DufsErrorCode {
             UploadDisabled => "upload-disabled",
             DeleteDisabled => "delete-disabled",
             HashDisabled => "hash-disabled",
-            IsADirectory => "is-a-directory",
-            InternalError => "internal-error",
+            PermissionDenied => "permission-denied",
             ArchiveDisabled => "archive-disabled",
             UploadNotFound => "upload-not-found",
             MissingUploadOffset => "missing-upload-offset",
@@ -73,6 +78,10 @@ impl DufsErrorCode {
             PreconditionFailed => "precondition-failed",
             DestinationExists => "destination-exists",
             Busy => "busy",
+            Conflict => "conflict",
+            IsADirectory => "is-a-directory",
+            InternalError => "internal-error",
+            InsufficientStorage => "insufficient-storage",
         }
     }
 
@@ -82,14 +91,16 @@ impl DufsErrorCode {
             InvalidPath | InvalidUploadOffset | InvalidUploadId | InvalidDepth
             | InvalidDestination => StatusCode::BAD_REQUEST,
             Forbidden | ReadonlyDescendant | UploadDisabled | DeleteDisabled | HashDisabled
-            | IsADirectory | InternalError => StatusCode::FORBIDDEN,
+            | PermissionDenied => StatusCode::FORBIDDEN,
             ArchiveDisabled | UploadNotFound => StatusCode::NOT_FOUND,
             MissingUploadOffset | AlreadyExists | MethodNotAllowed => {
                 StatusCode::METHOD_NOT_ALLOWED
             }
-            UploadIdInUse | UploadOffsetMismatch => StatusCode::CONFLICT,
+            Conflict | IsADirectory | UploadIdInUse | UploadOffsetMismatch => StatusCode::CONFLICT,
             PreconditionFailed | DestinationExists => StatusCode::PRECONDITION_FAILED,
+            InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Busy => StatusCode::SERVICE_UNAVAILABLE,
+            InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 
@@ -107,8 +118,7 @@ impl DufsErrorCode {
             UploadDisabled => "Forbidden: upload is disabled",
             DeleteDisabled => "Forbidden: delete is disabled",
             HashDisabled => "Forbidden: hash is disabled",
-            IsADirectory => "Forbidden: target is a directory",
-            InternalError => "Forbidden: failed to access the directory",
+            PermissionDenied => "Forbidden: permission denied by the file system",
             ArchiveDisabled => "Not Found",
             UploadNotFound => "Upload not found",
             UploadIdInUse => "Upload id is in use",
@@ -117,6 +127,24 @@ impl DufsErrorCode {
             AlreadyExists => "Already exists",
             Busy => "Server busy, retry later",
             MethodNotAllowed | PreconditionFailed | DestinationExists => "",
+            Conflict => "Conflict: a path component is not a directory or already exists",
+            IsADirectory => "Conflict: target is a directory",
+            InternalError => "Internal Server Error",
+            InsufficientStorage => "Insufficient Storage",
+        }
+    }
+
+    /// Error code for a file system error kind. `None` means the kind has no
+    /// dedicated code and is handled by [`respond_io_error`].
+    pub fn from_io_kind(kind: io::ErrorKind) -> Option<Self> {
+        match kind {
+            io::ErrorKind::PermissionDenied => Some(Self::PermissionDenied),
+            io::ErrorKind::NotADirectory | io::ErrorKind::AlreadyExists => Some(Self::Conflict),
+            io::ErrorKind::IsADirectory => Some(Self::IsADirectory),
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                Some(Self::InsufficientStorage)
+            }
+            _ => None,
         }
     }
 
@@ -137,6 +165,28 @@ impl DufsErrorCode {
     }
 }
 
+/// Write the response for an error returned by a request handler.
+///
+/// The first [`io::Error`] in the error chain decides: kinds with a dedicated
+/// [`DufsErrorCode`] get it, `NotFound` is a plain 404 and everything else a
+/// plain 500.
+pub fn respond_io_error(err: &anyhow::Error, res: &mut Response) {
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .map(io::Error::kind);
+    match kind {
+        Some(io::ErrorKind::NotFound) => {
+            *res.status_mut() = StatusCode::NOT_FOUND;
+            *res.body_mut() = body_full("Not Found");
+        }
+        Some(kind) => DufsErrorCode::from_io_kind(kind)
+            .unwrap_or(DufsErrorCode::InternalError)
+            .respond(res),
+        None => DufsErrorCode::InternalError.respond(res),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,7 +194,7 @@ mod tests {
     #[test]
     fn codes_are_unique() {
         use DufsErrorCode::*;
-        const ALL: [DufsErrorCode; 22] = [
+        const ALL: [DufsErrorCode; 25] = [
             InvalidPath,
             InvalidUploadOffset,
             InvalidUploadId,
@@ -155,8 +205,7 @@ mod tests {
             UploadDisabled,
             DeleteDisabled,
             HashDisabled,
-            IsADirectory,
-            InternalError,
+            PermissionDenied,
             ArchiveDisabled,
             UploadNotFound,
             UploadIdInUse,
@@ -164,9 +213,13 @@ mod tests {
             MissingUploadOffset,
             AlreadyExists,
             MethodNotAllowed,
+            Conflict,
+            IsADirectory,
             PreconditionFailed,
             DestinationExists,
             Busy,
+            InternalError,
+            InsufficientStorage,
         ];
         let mut codes = std::collections::HashSet::new();
         for code in ALL {

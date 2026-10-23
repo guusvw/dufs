@@ -548,7 +548,7 @@ class Uploader {
             } else if (code === "readonly-descendant") {
               this.fail("directory contains read-only entries");
             } else {
-              this.fail(`${ajax.status} ${ajax.statusText}`);
+              this.fail(ioErrorReason(code) || `${ajax.status} ${ajax.statusText}`);
             }
           }
         }
@@ -1547,7 +1547,7 @@ async function doDeletePath(name, url, cb, entry) {
     if (blocked) {
       showNotice(`Cannot delete \`${name}\`: ${blocked}`);
     } else {
-      showNotice(`Cannot delete \`${name}\`, ${err.message}`);
+      showNotice(`Cannot delete \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -1621,7 +1621,7 @@ async function doMovePath(fileUrl, isDir = false) {
     if (blocked) {
       showNotice(`Cannot move \`${filePath}\`: ${blocked}`);
     } else {
-      showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${err.message}`);
+      showNotice(`Cannot move \`${filePath}\` to \`${newPath}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -2173,7 +2173,7 @@ async function createFolder(name) {
     } else if (err.code === "upload-disabled") {
       showNotice(`Cannot create folder \`${name}\`: upload is disabled`);
     } else {
-      showNotice(`Cannot create folder \`${name}\`, ${err.message}`);
+      showNotice(`Cannot create folder \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -2194,7 +2194,7 @@ async function createFile(name) {
     } else if (err.code === "delete-disabled") {
       showNotice(`Cannot create file \`${name}\`: delete is disabled`);
     } else {
-      showNotice(`Cannot create file \`${name}\`, ${err.message}`);
+      showNotice(`Cannot create file \`${name}\`, ${ioErrorReason(err.code) || err.message}`);
     }
   }
 }
@@ -2635,6 +2635,19 @@ function movePathValidator(filePath) {
   };
 }
 
+/**
+ * Short reason for an error code caused by a file system failure on the server
+ * @param {string|null} code value of the x-dufs-error-code header
+ * @returns {string|undefined}
+ */
+function ioErrorReason(code) {
+  switch (code) {
+    case "permission-denied": return "permission denied by the server file system";
+    case "conflict": return "a parent path is not a directory or the target already exists";
+    case "is-a-directory": return "the target is a directory";
+    case "insufficient-storage": return "the server is out of storage space";
+  }
+}
 async function assertResOK(res) {
   if (!(res.status >= 200 && res.status < 300)) {
     const body = await res.text();
