@@ -297,3 +297,99 @@ fn upload_status_requires_allow_upload(server: TestServer) -> Result<(), Error> 
     assert_eq!(error_code(&resp), "upload-disabled");
     Ok(())
 }
+
+/// Permission bits are not enforced for root, so those tests are skipped there.
+#[cfg(unix)]
+fn running_as_root(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let probe = dir.join("probe-owner");
+    fs::write(&probe, "").unwrap();
+    let uid = fs::metadata(&probe).unwrap().uid();
+    fs::remove_file(&probe).unwrap();
+    uid == 0
+}
+
+#[cfg(unix)]
+#[rstest]
+fn resumed_upload_drops_setuid_and_keeps_mode(
+    #[with(ARGS)] server: TestServer,
+) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = server.path().join("test.txt");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o4750))?;
+    let data: Vec<u8> = (0..200_000u32).map(|v| (v % 251) as u8).collect();
+    let url = format!("{}test.txt?upload={ID}", server.url());
+    interrupted_put(&server, "/test.txt", ID, data.len(), &data[..50_000]);
+    let received_len = settled_offset(&url);
+    let resp = resume(&url, received_len, data[received_len as usize..].to_vec())?;
+    assert_eq!(resp.status(), 204);
+    assert_eq!(fs::read(&target)?, data);
+    assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o7777, 0o750);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn upload_id_put_keeps_read_only_file(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let target = server.path().join("test.txt");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+    let resp = fetch!(b"PUT", format!("{}test.txt?upload={ID}", server.url()))
+        .body("new")
+        .send()?;
+    assert_ne!(resp.status(), 201);
+    assert_eq!(fs::read_to_string(&target)?, "This is test.txt");
+    assert!(part_files(server.path()).is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn resume_keeps_file_made_read_only(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let target = server.path().join("test.txt");
+    let data: Vec<u8> = (0..200_000u32).map(|v| (v % 251) as u8).collect();
+    let url = format!("{}test.txt?upload={ID}", server.url());
+    interrupted_put(&server, "/test.txt", ID, data.len(), &data[..50_000]);
+    let received_len = settled_offset(&url);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+    let resp = resume(&url, received_len, data[received_len as usize..].to_vec())?;
+    assert_ne!(resp.status(), 204);
+    assert_eq!(fs::read_to_string(&target)?, "This is test.txt");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn upload_id_put_in_read_only_dir_writes_in_place(
+    #[with(ARGS)] server: TestServer,
+) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let dir = server.path().join("locked");
+    fs::create_dir(&dir)?;
+    let target = dir.join("file.txt");
+    fs::write(&target, "old")?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))?;
+    let resp = fetch!(
+        b"PUT",
+        format!("{}locked/file.txt?upload={ID}", server.url())
+    )
+    .body("new")
+    .send()?;
+    let status = resp.status();
+    let content = fs::read_to_string(&target)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    assert_eq!(status, 201);
+    assert_eq!(content, "new");
+    Ok(())
+}

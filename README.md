@@ -76,6 +76,7 @@ Options:
       --log-format <format>  Customize http log format
       --log-file <file>      Specify the file to save logs to, other than stdout/stderr
       --compress <level>     Set zip compress level [default: low] [possible values: none, low, medium, high]
+      --upload-part-ttl <duration>  Remove unfinished upload files after this long, e.g. 90m, 24h, 7d [default: 24h]
       --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
       --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
       --tls-key <path>       Path to the SSL/TLS certificate's private key
@@ -209,9 +210,11 @@ Resumable downloads
 curl -C- -o file http://127.0.0.1:5000/file
 ```
 
-Uploads with `PUT` are atomic: the body is written to a hidden `.<name>.dufs-<id>.part` file next to the target and renamed over it once complete, so an interrupted upload leaves the existing file untouched (and nothing behind for a new one). Leftover `.part` files older than 24 hours are removed at startup.
+Uploads with `PUT` are atomic: the body is written to a hidden `.<name>.dufs-<id>.part` file next to the target and renamed over it once complete, so an interrupted upload leaves the existing file untouched (and nothing behind for a new one). Leftover `.part` files that were not written to for longer than `--upload-part-ttl` (24 hours by default) are removed at startup and then every hour (or every half TTL if that is shorter), except those of uploads still in progress.
 
-Resumable uploads. Pick a random 32-character hex id and upload with `PUT /file?upload=<id>`. If the transfer is cut off, the bytes received so far stay in the hidden part file instead of being removed. `HEAD /file?upload=<id>` returns them in the `x-dufs-upload-offset` header (`404` once the upload is complete or gone), and `PATCH /file?upload=<id>` with `X-Update-Range: bytes=<offset>-` continues from there. The offset must equal the received length, otherwise the answer is `409` (`x-dufs-error-code: upload-offset-mismatch`). The file is replaced only when the last `PATCH` completes. A failed `PUT` response also carries the id in `x-dufs-upload-id`.
+A replaced file is a new inode, so hard links to the old file are not preserved. The old owner, group and permissions are kept, except the setuid and setgid bits, which are dropped. An existing file that is not writable (for example mode `0444`) is not overwritten. If the file is writable but its directory is not, no temp file can be created, so that upload is written in place and is not atomic.
+
+Resumable uploads. Pick a random 32-character hex id and upload with `PUT /file?upload=<id>`. If the transfer is cut off, the bytes received so far stay in the hidden part file instead of being removed. `HEAD /file?upload=<id>` returns them in the `x-dufs-upload-offset` header (`404` once the upload is complete or gone), and `PATCH /file?upload=<id>` with `X-Update-Range: bytes=<offset>-` continues from there. The offset must equal the received length, otherwise the answer is `409` (`x-dufs-error-code: upload-offset-mismatch`). The file is replaced only when the last `PATCH` completes. A failed `PUT` response also carries the id in `x-dufs-upload-id`. Where no part file can be created (see above), the upload is written in place and cannot be resumed.
 
 ```sh
 id=$(openssl rand -hex 16)
@@ -371,6 +374,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --log-format <format>   DUFS_LOG_FORMAT=""
     --log-file <file>       DUFS_LOG_FILE=./dufs.log
     --compress <compress>   DUFS_COMPRESS=low
+    --upload-part-ttl <duration>  DUFS_UPLOAD_PART_TTL=24h
     --tls-cert <path>       DUFS_TLS_CERT=cert.pem
     --tls-key <path>        DUFS_TLS_KEY=key.pem
 ```
@@ -409,6 +413,7 @@ assets: ./assets/
 log-format: '$remote_addr "$request" $status $http_user_agent'
 log-file: ./dufs.log
 compress: low
+upload-part-ttl: 24h
 tls-cert: tests/data/cert.pem
 tls-key: tests/data/key_pkcs1.pem
 ```

@@ -12,7 +12,7 @@ mod utils;
 extern crate log;
 
 use crate::args::{build_cli, print_completions, Args};
-use crate::server::{remove_stale_part_files, Server};
+use crate::server::Server;
 #[cfg(feature = "tls")]
 use crate::utils::{load_certs, load_private_key};
 
@@ -78,11 +78,11 @@ fn serve(args: Args, running: Arc<AtomicBool>) -> Result<Vec<JoinHandle<()>>> {
     let addrs = args.addrs.clone();
     let port = args.port;
     let tls_config = (args.tls_cert.clone(), args.tls_key.clone());
-    if !args.path_is_file {
-        let root = args.serve_path.clone();
-        tokio::task::spawn_blocking(move || remove_stale_part_files(&root));
-    }
+    let path_is_file = args.path_is_file;
     let server_handle = Arc::new(Server::init(args, running)?);
+    if !path_is_file {
+        server_handle.spawn_part_sweep();
+    }
     let mut handles = vec![];
     for bind_addr in addrs.iter() {
         let server_handle = server_handle.clone();

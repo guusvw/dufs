@@ -218,6 +218,81 @@ fn overwrite_keeps_permissions(#[with(ARGS)] server: TestServer) -> Result<(), E
     Ok(())
 }
 
+/// Permission bits are not enforced for root, so those tests are skipped there.
+#[cfg(unix)]
+fn running_as_root(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let probe = dir.join("probe-owner");
+    fs::write(&probe, "").unwrap();
+    let uid = fs::metadata(&probe).unwrap().uid();
+    fs::remove_file(&probe).unwrap();
+    uid == 0
+}
+
+#[cfg(unix)]
+#[rstest]
+fn read_only_file_is_not_overwritten(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let target = server.path().join("test.txt");
+    let original = fs::read(&target)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+    let resp = fetch!(b"PUT", format!("{}test.txt", server.url()))
+        .body("new")
+        .send()?;
+    assert_ne!(resp.status(), 201);
+    assert_eq!(fs::read(&target)?, original);
+    assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o444);
+    assert!(part_files(server.path()).is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn overwrite_drops_setuid(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = server.path().join("test.txt");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o4755))?;
+    let resp = fetch!(b"PUT", format!("{}test.txt", server.url()))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(fs::read_to_string(&target)?, "new");
+    assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o7777, 0o755);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn writable_file_in_read_only_dir_is_written_in_place(
+    #[with(ARGS)] server: TestServer,
+) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let dir = server.path().join("locked");
+    fs::create_dir(&dir)?;
+    let target = dir.join("file.txt");
+    fs::write(&target, "old")?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))?;
+    let inode = fs::metadata(&target)?.ino();
+    let resp = fetch!(b"PUT", format!("{}locked/file.txt", server.url()))
+        .body("new")
+        .send()?;
+    let result = (|| -> Result<(), Error> {
+        assert_eq!(resp.status(), 201);
+        assert_eq!(fs::read_to_string(&target)?, "new");
+        assert_eq!(fs::metadata(&target)?.ino(), inode);
+        Ok(())
+    })();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    result
+}
+
 #[rstest]
 fn stale_part_files_removed_at_startup(
     tmpdir: assert_fs::TempDir,
@@ -246,5 +321,61 @@ fn stale_part_files_removed_at_startup(
     child.wait()?;
     assert!(fresh.exists());
     assert!(lookalike.exists());
+    Ok(())
+}
+
+const PART_ID: &str = "fedcba9876543210fedcba9876543210";
+const TTL_ARGS: &[&str] = &[
+    "--allow-upload",
+    "--allow-delete",
+    "--upload-part-ttl",
+    "1s",
+];
+
+fn age_part_file(path: &Path) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+}
+
+#[rstest]
+fn stale_part_files_are_swept_while_running(
+    #[with(TTL_ARGS)] server: TestServer,
+) -> Result<(), Error> {
+    let dir = server.path().join("dir1");
+    let stale = dir.join(format!(".a.dufs-{PART_ID}.part"));
+    let lookalike = dir.join(".b.part");
+    fs::write(&stale, "stale")?;
+    fs::write(&lookalike, "other")?;
+    age_part_file(&stale);
+    age_part_file(&lookalike);
+    wait_until("sweep", || !stale.exists());
+    assert!(lookalike.exists());
+    Ok(())
+}
+
+#[rstest]
+#[case::plain_put("")]
+#[case::upload_id(&format!("?upload={PART_ID}"))]
+fn active_upload_is_never_swept(
+    #[with(TTL_ARGS)] server: TestServer,
+    #[case] query: &str,
+) -> Result<(), Error> {
+    let mut put = SlowPut::start(&server, &format!("/new.txt{query}"), 10, b"01234");
+    wait_until("part file", || part_files(server.path()).len() == 1);
+    let part = server.path().join(&part_files(server.path())[0]);
+    // The upload has stalled for longer than the TTL.
+    age_part_file(&part);
+    sleep(Duration::from_millis(2500));
+    assert!(part.exists(), "active part file was swept");
+    put.send(b"56789");
+    assert_eq!(put.status(), "HTTP/1.1 201");
+    assert_eq!(
+        fs::read_to_string(server.path().join("new.txt"))?,
+        "0123456789"
+    );
     Ok(())
 }
