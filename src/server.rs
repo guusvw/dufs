@@ -26,7 +26,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+        CONTENT_TYPE, IF_MATCH, IF_UNMODIFIED_SINCE, RANGE,
     },
     Method, StatusCode, Uri,
 };
@@ -457,6 +457,8 @@ impl Server {
                     DufsErrorCode::UploadDisabled.respond(&mut res);
                 } else if !allow_delete && size > 0 {
                     DufsErrorCode::DeleteDisabled.respond(&mut res);
+                } else if write_precondition_failed(path, headers).await {
+                    DufsErrorCode::PreconditionFailed.respond(&mut res);
                 } else {
                     self.handle_upload(path, None, upload_id, size, req, &mut res)
                         .await?;
@@ -1129,35 +1131,24 @@ impl Server {
         let size = meta.len();
         let mut use_range = true;
         if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
-            if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
-                if !if_unmodified_since.precondition_passes(last_modified.into()) {
-                    DufsErrorCode::PreconditionFailed.respond(res);
-                    return Ok(());
-                }
-            }
-            if let Some(if_match) = headers.typed_get::<IfMatch>() {
-                if !if_match.precondition_passes(&etag) {
-                    DufsErrorCode::PreconditionFailed.respond(res);
-                    return Ok(());
-                }
-            }
-            if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
-                if !if_modified_since.is_modified(last_modified.into()) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-            if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-                if !if_none_match.precondition_passes(&etag) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-
+            // A 304 must carry the validators and Cache-Control a 200 would,
+            // so insert them before evaluating the conditions.
             res.headers_mut()
                 .typed_insert(CacheControl::new().with_no_cache());
             res.headers_mut().typed_insert(last_modified);
             res.headers_mut().typed_insert(etag.clone());
+
+            match evaluate_preconditions(headers, &etag, last_modified, true) {
+                Precondition::Pass => {}
+                Precondition::Failed => {
+                    DufsErrorCode::PreconditionFailed.respond(res);
+                    return Ok(());
+                }
+                Precondition::NotModified => {
+                    *res.status_mut() = StatusCode::NOT_MODIFIED;
+                    return Ok(());
+                }
+            }
 
             if headers.typed_get::<Range>().is_some() {
                 use_range = headers
@@ -2307,6 +2298,67 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     }
     zip.finish().await?;
     Ok(())
+}
+
+enum Precondition {
+    Pass,
+    Failed,
+    NotModified,
+}
+
+/// Evaluate conditional headers in the order of RFC 9110 section 13.2.2.
+///
+/// `If-Match` takes precedence over `If-Unmodified-Since`, and
+/// `If-None-Match` over `If-Modified-Since`; the date headers are only
+/// consulted when their ETag counterpart is absent. The `If-None-Match` and
+/// `If-Modified-Since` steps apply to reads only (`is_read`).
+fn evaluate_preconditions(
+    headers: &HeaderMap<HeaderValue>,
+    etag: &ETag,
+    last_modified: LastModified,
+    is_read: bool,
+) -> Precondition {
+    if let Some(if_match) = headers.typed_get::<IfMatch>() {
+        if !if_match.precondition_passes(etag) {
+            return Precondition::Failed;
+        }
+    } else if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
+        if !if_unmodified_since.precondition_passes(last_modified.into()) {
+            return Precondition::Failed;
+        }
+    }
+    if !is_read {
+        return Precondition::Pass;
+    }
+    if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
+        if !if_none_match.precondition_passes(etag) {
+            return Precondition::NotModified;
+        }
+    } else if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
+        if !if_modified_since.is_modified(last_modified.into()) {
+            return Precondition::NotModified;
+        }
+    }
+    Precondition::Pass
+}
+
+/// Whether a write to `path` must be refused because its `If-Match` or
+/// `If-Unmodified-Since` header no longer matches the stored file.
+///
+/// A missing file has no representation, so any `If-Match` fails against it.
+async fn write_precondition_failed(path: &Path, headers: &HeaderMap<HeaderValue>) -> bool {
+    if !headers.contains_key(IF_MATCH) && !headers.contains_key(IF_UNMODIFIED_SINCE) {
+        return false;
+    }
+    match fs::metadata(path).await {
+        Ok(meta) => extract_cache_headers(&meta).is_some_and(|(etag, last_modified)| {
+            matches!(
+                evaluate_preconditions(headers, &etag, last_modified, false),
+                Precondition::Failed
+            )
+        }),
+        Err(_) => headers.contains_key(IF_MATCH),
+    }
 }
 
 fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
