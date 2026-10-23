@@ -82,7 +82,10 @@ fn format_mtime(mtime: u64) -> Option<String> {
     Some(datetime.format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string())
 }
 
-fn format_size(size: u64, path_type: PathType) -> String {
+fn format_size(size: Option<u64>, path_type: PathType) -> String {
+    let Some(size) = size else {
+        return "\u{2014}".to_string();
+    };
     if path_type.is_dir() {
         let unit = if size == 1 { "item" } else { "items" };
         let num = match size >= MAX_SUBPATHS_COUNT {

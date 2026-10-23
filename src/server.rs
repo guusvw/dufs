@@ -74,6 +74,7 @@ pub const MAX_SUBPATHS_COUNT: u64 = 1000;
 const WALK_CHANNEL_SIZE: usize = 256;
 /// Requests allowed to wait for a free walk slot before new ones get a 503.
 const MAX_QUEUED_WALKS: usize = 128;
+const MAX_READDIR_ERRORS: u32 = 100;
 
 pub struct Server {
     args: Args,
@@ -343,6 +344,7 @@ impl Server {
                             self.handle_search_dir(
                                 path,
                                 &query_params,
+                                headers,
                                 head_only,
                                 user,
                                 access_paths,
@@ -383,6 +385,7 @@ impl Server {
                         self.handle_search_dir(
                             path,
                             &query_params,
+                            headers,
                             head_only,
                             user,
                             access_paths,
@@ -394,6 +397,7 @@ impl Server {
                             path,
                             true,
                             &query_params,
+                            headers,
                             head_only,
                             user,
                             access_paths,
@@ -443,6 +447,7 @@ impl Server {
                         path,
                         false,
                         &query_params,
+                        headers,
                         head_only,
                         user,
                         access_paths,
@@ -765,26 +770,48 @@ impl Server {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_ls_dir(
         &self,
         path: &Path,
         exist: bool,
         query_params: &HashMap<String, String>,
+        headers: &HeaderMap<HeaderValue>,
         head_only: bool,
         user: Option<String>,
         access_paths: AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
         let mut paths = vec![];
+        let mut etag = None;
         if !head_only && exist {
+            // Read the mtime before listing: a change in between then only
+            // causes a spurious refresh, never a stale 304.
+            let mtime = dir_mtime_nanos(path).await;
             paths = match self.list_dir(path, path, &access_paths).await {
                 Ok(paths) => paths,
                 Err(err) => {
                     respond_io_error(&err, res);
                     return Ok(());
                 }
+            };
+            if has_query_flag(query_params, "json") {
+                etag = mtime.and_then(|mtime| {
+                    format!(r#""{mtime:x}-{}""#, paths.len())
+                        .parse::<ETag>()
+                        .ok()
+                });
             }
         };
+        if let Some(etag) = &etag {
+            if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
+                if !if_none_match.precondition_passes(etag) {
+                    *res.status_mut() = StatusCode::NOT_MODIFIED;
+                    res.headers_mut().typed_insert(etag.clone());
+                    return Ok(());
+                }
+            }
+        }
         self.send_index(
             path,
             paths,
@@ -795,13 +822,19 @@ impl Server {
             user,
             access_paths,
             res,
-        )
+        )?;
+        if let Some(etag) = etag {
+            res.headers_mut().typed_insert(etag);
+        }
+        Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_search_dir(
         &self,
         path: &Path,
         query_params: &HashMap<String, String>,
+        headers: &HeaderMap<HeaderValue>,
         head_only: bool,
         user: Option<String>,
         access_paths: AccessPaths,
@@ -815,7 +848,16 @@ impl Server {
             .to_lowercase();
         if search.is_empty() {
             return self
-                .handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
+                .handle_ls_dir(
+                    path,
+                    true,
+                    query_params,
+                    headers,
+                    head_only,
+                    user,
+                    access_paths,
+                    res,
+                )
                 .await;
         }
 
@@ -949,8 +991,17 @@ impl Server {
             self.handle_send_file(&index_path, headers, head_only, res)
                 .await?;
         } else if self.args.render_try_index {
-            self.handle_ls_dir(path, true, query_params, head_only, user, access_paths, res)
-                .await?;
+            self.handle_ls_dir(
+                path,
+                true,
+                query_params,
+                headers,
+                head_only,
+                user,
+                access_paths,
+                res,
+            )
+            .await?;
         } else {
             self.handle_not_found(query_params, head_only, res).await?;
         }
@@ -1866,10 +1917,30 @@ impl Server {
             }
         } else {
             let mut rd = fs::read_dir(entry_path).await?;
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path, access_paths, &prefix)
-                    .await;
+            let mut errors = 0;
+            loop {
+                match rd.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let entry_path = entry.path();
+                        self.add_pathitem(
+                            &mut paths,
+                            base_path,
+                            &entry_path,
+                            access_paths,
+                            &prefix,
+                        )
+                        .await;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Failed to read an entry of {}, {e}", entry_path.display());
+                        errors += 1;
+                        // a persistent failure would otherwise never end
+                        if errors >= MAX_READDIR_ERRORS {
+                            break;
+                        }
+                    }
+                }
             }
         }
         Ok(paths)
@@ -1896,6 +1967,44 @@ impl Server {
         }
     }
 
+    /// Count visible children, stopping at `MAX_SUBPATHS_COUNT`. Returns `None`
+    /// if the directory cannot be read, so the entry is still listed.
+    async fn count_children(&self, path: &Path) -> Option<u64> {
+        let mut count = 0;
+        let mut entries = match fs::read_dir(path).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to count entries of {}, {e}", path.display());
+                return None;
+            }
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(v)) => v,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Failed to count entries of {}, {e}", path.display());
+                    return None;
+                }
+            };
+            let entry_path = entry.path();
+            let base_name = get_file_name(&entry_path);
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|v| v.is_dir())
+                .unwrap_or_default();
+            if is_hidden(&self.args.hidden, base_name, is_dir) {
+                continue;
+            }
+            count += 1;
+            if count >= MAX_SUBPATHS_COUNT {
+                break;
+            }
+        }
+        Some(count)
+    }
+
     async fn to_pathitem<P: AsRef<Path>>(&self, path: P, base_path: P) -> Result<Option<PathItem>> {
         let path = path.as_ref();
         let (meta, meta2) = tokio::join!(fs::metadata(&path), fs::symlink_metadata(&path));
@@ -1916,28 +2025,8 @@ impl Server {
             None => 0,
         };
         let size = match path_type {
-            PathType::Dir | PathType::SymlinkDir => {
-                let mut count = 0;
-                let mut entries = tokio::fs::read_dir(&path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let entry_path = entry.path();
-                    let base_name = get_file_name(&entry_path);
-                    let is_dir = entry
-                        .file_type()
-                        .await
-                        .map(|v| v.is_dir())
-                        .unwrap_or_default();
-                    if is_hidden(&self.args.hidden, base_name, is_dir) {
-                        continue;
-                    }
-                    count += 1;
-                    if count >= MAX_SUBPATHS_COUNT {
-                        break;
-                    }
-                }
-                count
-            }
-            PathType::File | PathType::SymlinkFile => meta.len(),
+            PathType::Dir | PathType::SymlinkDir => self.count_children(path).await,
+            PathType::File | PathType::SymlinkFile => Some(meta.len()),
         };
         let rel_path = path.strip_prefix(base_path)?;
         let name = normalize_path(rel_path);
@@ -1982,7 +2071,9 @@ pub struct PathItem {
     pub path_type: PathType,
     pub name: String,
     pub mtime: u64,
-    pub size: u64,
+    /// Item count for directories, byte length for files; `None` when a
+    /// directory's children cannot be read.
+    pub size: Option<u64>,
     pub allow_upload: bool,
     pub allow_delete: bool,
     pub readonly_descendant: bool,
@@ -2030,7 +2121,7 @@ impl PathItem {
 <D:status>HTTP/1.1 200 OK</D:status>
 </D:propstat>
 </D:response>"#,
-                self.size
+                self.size.unwrap_or_default()
             ),
         }
     }
@@ -2419,6 +2510,16 @@ async fn write_precondition_failed(path: &Path, headers: &HeaderMap<HeaderValue>
         }),
         Err(_) => headers.contains_key(IF_MATCH),
     }
+}
+
+async fn dir_mtime_nanos(path: &Path) -> Option<u128> {
+    let modified = fs::metadata(path).await.ok()?.modified().ok()?;
+    Some(
+        modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
 }
 
 fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {

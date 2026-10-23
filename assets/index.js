@@ -57,7 +57,7 @@ applyTheme(loadTheme());
  * @property {"Dir"|"SymlinkDir"|"File"|"SymlinkFile"} path_type
  * @property {string} name
  * @property {number} mtime
- * @property {number} size
+ * @property {number|null} size
  * @property {boolean} allow_upload
  * @property {boolean} allow_delete
  * @property {boolean} readonly_descendant
@@ -1109,7 +1109,7 @@ function addPath(file, showMove, showDelete) {
     ${slot(actionEdit)}
   </td>`;
 
-  let sizeDisplay = isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
+  let sizeDisplay = file.size === null ? "\u2014" : isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
 
   $pathsTableBody.insertAdjacentHTML("beforeend", `
 <tr data-name="${escapedName}">
