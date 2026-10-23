@@ -763,13 +763,15 @@ function setupSearch() {
   $searchbar.classList.remove("hidden");
   $searchbar.addEventListener("submit", event => {
     event.preventDefault();
-    const formData = new FormData($searchbar);
-    const q = formData.get("q");
-    let href = baseUrl();
-    if (q) {
-      href += "?q=" + q;
+    const q = new FormData($searchbar).get("q");
+    const params = new URLSearchParams();
+    if (q.trim()) {
+      params.set("q", q);
     }
-    location.href = href;
+    if (PARAMS.sort) params.set("sort", PARAMS.sort);
+    if (PARAMS.order) params.set("order", PARAMS.order);
+    const qs = params.toString();
+    location.href = qs ? `${baseUrl()}?${qs}` : baseUrl();
   });
   if (PARAMS.q) {
     document.getElementById('search').value = PARAMS.q;
