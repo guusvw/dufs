@@ -359,6 +359,8 @@ class Uploader {
     this.speedTimes = [];
     this.currentSpeed = 0;
     this.uploadOffset = 0;
+    this.resume = false;
+    this.uploadId = newUploadId();
     this.lastUptime = 0;
     // queued -> running -> done | failed | cancelled; a failed or cancelled
     // row can be queued again by Retry
@@ -520,8 +522,6 @@ class Uploader {
   }
 
   ajax() {
-    const { url } = this;
-
     this.attempted = true;
     this.startTime = Date.now();
     this.lastUptime = this.startTime;
@@ -555,29 +555,33 @@ class Uploader {
     })
     ajax.addEventListener("error", () => this.fail("network error"), false);
     ajax.addEventListener("abort", () => this.fail("upload aborted"), false);
-    if (this.uploadOffset > 0) {
-      ajax.open("PATCH", url);
-      ajax.setRequestHeader("X-Update-Range", "append");
+    const uploadUrl = this.uploadUrl();
+    if (this.resume) {
+      ajax.open("PATCH", uploadUrl);
+      ajax.setRequestHeader("X-Update-Range", `bytes=${this.uploadOffset}-`);
       ajax.send(this.file.slice(this.uploadOffset));
     } else {
-      ajax.open("PUT", url);
+      ajax.open("PUT", uploadUrl);
       ajax.send(this.file);
     }
   }
 
   /**
    * Send the request. After an earlier attempt the server is asked how much
-   * of the file it already has, and only the rest is sent.
+   * of the file it already has under this upload's id, and only the rest is
+   * sent. Only an upload this uploader started can be continued, and only
+   * through its id. Anything else, such as a file that already exists under
+   * this name, is not ours to append to: start over with a full PUT instead.
    */
   async start() {
+    this.resume = false;
     this.uploadOffset = 0;
     if (this.attempted) {
       try {
-        const res = await fetch(this.url, {
-          method: "HEAD",
-        });
+        const res = await fetch(this.uploadUrl(), { method: "HEAD" });
         if (res.status == 200) {
-          this.uploadOffset = parseInt(res.headers.get("content-length")) || 0;
+          this.resume = true;
+          this.uploadOffset = parseInt(res.headers.get("x-dufs-upload-offset")) || 0;
         }
       } catch {
         this.fail("network error");
@@ -585,9 +589,13 @@ class Uploader {
       }
       // cancelled while the server was being asked
       if (this.state !== "running") return;
+      if (!this.resume) this.uploadId = newUploadId();
     }
-
     this.ajax();
+  }
+
+  uploadUrl() {
+    return `${this.url}?upload=${this.uploadId}`;
   }
 
   progress(event) {
@@ -2212,6 +2220,15 @@ function newUrl(name) {
   if (!url.endsWith("/")) url += "/";
   url += name.split("/").map(encodeURIComponent).join("/");
   return url;
+}
+
+/**
+ * Random id naming an upload on the server, which keeps the bytes of an
+ * interrupted upload under it so that the upload can be resumed.
+ */
+function newUploadId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 }
 
 function baseUrl() {

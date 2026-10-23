@@ -27,7 +27,7 @@ fn cors(#[with(&["--enable-cors"])] server: TestServer) -> Result<(), Error> {
     );
     assert_eq!(
         resp.headers().get("access-control-expose-headers").unwrap(),
-        "Authorization,X-Dufs-Error-Code,*"
+        "Authorization,X-Dufs-Error-Code,X-Dufs-Upload-Id,X-Dufs-Upload-Offset,*"
     );
     Ok(())
 }

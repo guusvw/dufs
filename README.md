@@ -211,13 +211,17 @@ curl -C- -o file http://127.0.0.1:5000/file
 
 Uploads with `PUT` are atomic: the body is written to a hidden `.<name>.dufs-<id>.part` file next to the target and renamed over it once complete, so an interrupted upload leaves the existing file untouched (and nothing behind for a new one). Leftover `.part` files older than 24 hours are removed at startup.
 
-Resumable uploads (`PATCH` appends to a file that already exists)
+Resumable uploads. Pick a random 32-character hex id and upload with `PUT /file?upload=<id>`. If the transfer is cut off, the bytes received so far stay in the hidden part file instead of being removed. `HEAD /file?upload=<id>` returns them in the `x-dufs-upload-offset` header (`404` once the upload is complete or gone), and `PATCH /file?upload=<id>` with `X-Update-Range: bytes=<offset>-` continues from there. The offset must equal the received length, otherwise the answer is `409` (`x-dufs-error-code: upload-offset-mismatch`). The file is replaced only when the last `PATCH` completes. A failed `PUT` response also carries the id in `x-dufs-upload-id`.
 
 ```sh
-upload_offset=$(curl -I -s http://127.0.0.1:5000/file | tr -d '\r' | sed -n 's/content-length: //p')
-dd skip=$upload_offset if=file status=none ibs=1 | \
-  curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
+id=$(openssl rand -hex 16)
+curl -T file "http://127.0.0.1:5000/file?upload=$id"       # interrupted
+offset=$(curl -sI "http://127.0.0.1:5000/file?upload=$id" | tr -d '\r' | sed -n 's/^x-dufs-upload-offset: //pI')
+tail -c +$((offset + 1)) file | \
+  curl -X PATCH -H "X-Update-Range: bytes=$offset-" --data-binary @- "http://127.0.0.1:5000/file?upload=$id"
 ```
+
+Without an upload id, `PATCH` modifies a file in place (`X-Update-Range: append`, or `bytes=<offset>-`, up to the end of the file). Like overwriting with `PUT`, changing a file that already has content needs `--allow-delete`.
 
 Health checks
 
