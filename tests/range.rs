@@ -111,7 +111,7 @@ fn head_file_range_last_pos_beyond_eof(server: TestServer) -> Result<(), Error> 
 #[rstest]
 fn get_file_multipart_range_last_pos_beyond_eof(server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"GET", format!("{}index.html", server.url()))
-        .header("range", HeaderValue::from_static("bytes=0-19, 6-17"))
+        .header("range", HeaderValue::from_static("bytes=0-5, 9-19"))
         .send()?;
     assert_eq!(resp.status(), 206);
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
@@ -132,12 +132,12 @@ fn get_file_multipart_range_last_pos_beyond_eof(server: TestServer) -> Result<()
     assert_eq!(parts.len(), 2);
 
     let (headers, body) = &parts[0];
-    assert_eq!(headers.get("content-range").unwrap(), "bytes 0-17/18");
-    assert_eq!(*body, "This is index.html");
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 0-5/18");
+    assert_eq!(*body, "This i");
 
     let (headers, body) = &parts[1];
-    assert_eq!(headers.get("content-range").unwrap(), "bytes 6-17/18");
-    assert_eq!(*body, "s index.html");
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 9-17/18");
+    assert_eq!(*body, "ndex.html");
 
     Ok(())
 }
@@ -176,7 +176,7 @@ fn parse_multipart_body<'a>(body: &'a str, boundary: &str) -> Vec<(HeaderMap, &'
 #[rstest]
 fn get_file_multipart_range(server: TestServer) -> Result<(), Error> {
     let resp = fetch!(b"GET", format!("{}index.html", server.url()))
-        .header("range", HeaderValue::from_static("bytes=0-11, 6-17"))
+        .header("range", HeaderValue::from_static("bytes=0-5, 9-17"))
         .send()?;
     assert_eq!(resp.status(), 206);
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
@@ -197,12 +197,12 @@ fn get_file_multipart_range(server: TestServer) -> Result<(), Error> {
     assert_eq!(parts.len(), 2);
 
     let (headers, body) = &parts[0];
-    assert_eq!(headers.get("content-range").unwrap(), "bytes 0-11/18");
-    assert_eq!(*body, "This is inde");
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 0-5/18");
+    assert_eq!(*body, "This i");
 
     let (headers, body) = &parts[1];
-    assert_eq!(headers.get("content-range").unwrap(), "bytes 6-17/18");
-    assert_eq!(*body, "s index.html");
+    assert_eq!(headers.get("content-range").unwrap(), "bytes 9-17/18");
+    assert_eq!(*body, "ndex.html");
 
     Ok(())
 }
@@ -238,7 +238,7 @@ fn get_file_multipart_range_too_many(server: TestServer) -> Result<(), Error> {
 fn head_file_multipart_range(server: TestServer) -> Result<(), Error> {
     // HEAD must report the same headers as GET without transferring a body
     let get = fetch!(b"GET", format!("{}index.html", server.url()))
-        .header("range", HeaderValue::from_static("bytes=0-11, 6-17"))
+        .header("range", HeaderValue::from_static("bytes=0-5, 9-17"))
         .send()?;
     assert_eq!(get.status(), 206);
     let content_type = get
@@ -251,7 +251,7 @@ fn head_file_multipart_range(server: TestServer) -> Result<(), Error> {
     let body_len = get.text()?.len();
 
     let resp = fetch!(b"HEAD", format!("{}index.html", server.url()))
-        .header("range", HeaderValue::from_static("bytes=0-11, 6-17"))
+        .header("range", HeaderValue::from_static("bytes=0-5, 9-17"))
         .send()?;
     assert_eq!(resp.status(), 206);
     let head_content_type = resp.headers().get("content-type").unwrap().to_str()?;
@@ -277,7 +277,7 @@ fn get_file_multipart_range_large(#[with(&["-A"])] server: TestServer) -> Result
     let resp = fetch!(b"GET", &url)
         .header(
             "range",
-            HeaderValue::from_static("bytes=0-149999, 100000-199999"),
+            HeaderValue::from_static("bytes=0-99999, 150000-199999"),
         )
         .send()?;
     assert_eq!(resp.status(), 206);
@@ -292,8 +292,8 @@ fn get_file_multipart_range_large(#[with(&["-A"])] server: TestServer) -> Result
     let body = resp.text()?;
     let parts = parse_multipart_body(&body, boundary);
     assert_eq!(parts.len(), 2);
-    assert_eq!(parts[0].1, &data[0..150_000]);
-    assert_eq!(parts[1].1, &data[100_000..200_000]);
+    assert_eq!(parts[0].1, &data[0..100_000]);
+    assert_eq!(parts[1].1, &data[150_000..200_000]);
     Ok(())
 }
 
@@ -328,5 +328,78 @@ fn get_file_multipart_range_reversed(server: TestServer) -> Result<(), Error> {
     assert_eq!(resp.status(), 416);
     assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */18");
     assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+    Ok(())
+}
+
+#[rstest]
+fn get_file_overlapping_ranges_covering_file(server: TestServer) -> Result<(), Error> {
+    // 0-,1-,2- merge into one range covering the whole file: plain 200
+    let resp = fetch!(b"GET", format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("bytes=0-,1-,2-"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-range").is_none());
+    assert_eq!(resp.headers().get("content-length").unwrap(), "18");
+    assert_eq!(resp.text()?, "This is index.html");
+    Ok(())
+}
+
+#[rstest]
+fn get_file_adjacent_ranges_covering_file(server: TestServer) -> Result<(), Error> {
+    let resp = fetch!(b"GET", format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("bytes=9-17, 0-8"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is index.html");
+    Ok(())
+}
+
+#[rstest]
+fn get_file_overlapping_ranges_merged(server: TestServer) -> Result<(), Error> {
+    // 0-5 and 3-8 overlap -> one 206 part, not multipart
+    let resp = fetch!(b"GET", format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("bytes=0-5, 3-8"))
+        .send()?;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.headers().get("content-range").unwrap(), "bytes 0-8/18");
+    assert_eq!(resp.headers().get("content-length").unwrap(), "9");
+    assert_eq!(resp.text()?, "This is i");
+    Ok(())
+}
+
+#[rstest]
+fn get_file_overlapping_ranges_keep_disjoint(server: TestServer) -> Result<(), Error> {
+    // 0-3 and 2-5 merge to 0-5; 10-12 stays separate
+    let resp = fetch!(b"GET", format!("{}index.html", server.url()))
+        .header("range", HeaderValue::from_static("bytes=10-12, 0-3, 2-5"))
+        .send()?;
+    assert_eq!(resp.status(), 206);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()?
+        .to_string();
+    let boundary = content_type.split_once('=').unwrap().1.trim_ascii_start();
+    let body = resp.text()?;
+    let parts = parse_multipart_body(&body, boundary);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0.get("content-range").unwrap(), "bytes 0-5/18");
+    assert_eq!(parts[0].1, "This i");
+    assert_eq!(parts[1].0.get("content-range").unwrap(), "bytes 10-12/18");
+    assert_eq!(parts[1].1, "dex");
+    Ok(())
+}
+
+#[rstest]
+fn get_large_file_range_streams_fully(server: TestServer) -> Result<(), Error> {
+    // spans several 64 KiB chunks of the range stream
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(server.path().join("big.bin"), &data)?;
+    let resp = fetch!(b"GET", format!("{}big.bin", server.url()))
+        .header("range", HeaderValue::from_static("bytes=1000-250999"))
+        .send()?;
+    assert_eq!(resp.status(), 206);
+    assert_eq!(resp.bytes()?.as_ref(), &data[1000..251000]);
     Ok(())
 }

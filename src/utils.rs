@@ -146,6 +146,23 @@ pub fn parse_range(range: &str, size: u64) -> Option<Vec<(u64, u64)>> {
     Some(result)
 }
 
+/// Sort `ranges` and merge those that overlap or touch, so a response never
+/// sends the same byte twice and a client cannot amplify one small request
+/// into many overlapping parts.
+pub fn coalesce_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= last_end.saturating_add(1) => {
+                *last_end = (*last_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
 pub fn is_ipv6_available() -> bool {
     std::net::TcpListener::bind("[::]:0").is_ok() && std::net::TcpListener::bind("[::1]:0").is_ok()
 }
@@ -201,6 +218,32 @@ mod tests {
         assert_eq!(join_within(base, ".."), None);
         assert_eq!(join_within(base, "a/../secret"), None);
         assert_eq!(join_within(base, "a/../../secret"), None);
+    }
+
+    #[test]
+    fn test_coalesce_ranges() {
+        assert_eq!(coalesce_ranges(vec![]), vec![]);
+        assert_eq!(coalesce_ranges(vec![(0, 9)]), vec![(0, 9)]);
+        // overlapping
+        assert_eq!(coalesce_ranges(vec![(0, 9), (5, 14)]), vec![(0, 14)]);
+        // contained
+        assert_eq!(coalesce_ranges(vec![(0, 99), (10, 20)]), vec![(0, 99)]);
+        // adjacent
+        assert_eq!(coalesce_ranges(vec![(0, 9), (10, 19)]), vec![(0, 19)]);
+        // disjoint stays separate, and the result is sorted
+        assert_eq!(
+            coalesce_ranges(vec![(20, 29), (0, 9), (11, 15)]),
+            vec![(0, 9), (11, 15), (20, 29)]
+        );
+        // bridging range joins everything
+        assert_eq!(
+            coalesce_ranges(vec![(0, 4), (10, 14), (3, 11)]),
+            vec![(0, 14)]
+        );
+        assert_eq!(
+            coalesce_ranges(vec![(0, u64::MAX), (1, 2)]),
+            vec![(0, u64::MAX)]
+        );
     }
 
     #[test]
