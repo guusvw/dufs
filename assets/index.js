@@ -108,6 +108,24 @@ let $logoutBtn;
  * @type Element
  */
 let $userName;
+/**
+ * @type Element
+ */
+let $saveBtn;
+/**
+ * @type Element
+ */
+let $overwriteBtn;
+/**
+ * @type Element
+ */
+let $saveStatus;
+let saveStatusTimer;
+/**
+ * ETag of the file as last loaded or saved by the editor, sent as If-Match.
+ * @type {string|null}
+ */
+let editorEtag = null;
 
 // manage unload event to prevent leaving with uploads in progress
 const beforeUnloadHandler = (event) => {
@@ -149,6 +167,7 @@ async function ready() {
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
   $userName = document.querySelector(".user-name");
+  $saveStatus = document.querySelector(".save-status");
 
   window.addEventListener('beforeunload', beforeUnloadHandler);
 
@@ -809,9 +828,12 @@ async function setupEditorPage() {
     }
 
     if (DATA.editable && DATA.allow_upload) {
-      const $saveBtn = document.querySelector(".save-btn");
+      $saveBtn = document.querySelector(".save-btn");
       $saveBtn.classList.remove("hidden");
-      $saveBtn.addEventListener("click", saveChange);
+      $saveBtn.addEventListener("click", () => saveChange(false));
+      $overwriteBtn = document.querySelector(".editor-overwrite-btn");
+      $overwriteBtn.addEventListener("click", () => saveChange(true));
+      document.querySelector(".editor-reload-btn").addEventListener("click", () => location.reload());
     }
   }
 
@@ -837,6 +859,7 @@ async function setupEditorPage() {
   try {
     const res = await fetch(baseUrl());
     await assertResOK(res);
+    editorEtag = res.headers.get("etag");
     const encoding = getEncoding(res.headers.get("content-type"));
     if (encoding === "utf-8") {
       $editor.value = await res.text();
@@ -951,16 +974,79 @@ async function doMovePath(fileUrl) {
 /**
  * Save editor change
  */
-async function saveChange() {
+async function saveChange(overwrite) {
+  const hadFocus = document.activeElement === $saveBtn;
+  $saveBtn.disabled = true;
+  $overwriteBtn.disabled = true;
+  clearTimeout(saveStatusTimer);
+  hideEditorError();
+  $saveStatus.textContent = "Saving…";
+  const name = baseName(baseUrl());
   try {
-    await fetch(baseUrl(), {
+    await checkAuth();
+    const headers = {};
+    if (editorEtag && !overwrite) {
+      headers["If-Match"] = editorEtag;
+    }
+    const res = await fetch(baseUrl(), {
       method: "PUT",
+      headers,
       body: $editor.value,
     });
-    location.reload();
+    await assertResOK(res);
+    editorEtag = await fetchEtag();
+    $saveStatus.textContent = "Saved";
+    saveStatusTimer = setTimeout(() => {
+      $saveStatus.textContent = "";
+    }, 3000);
   } catch (err) {
-    alert(`Failed to save file, ${err.message}`);
+    $saveStatus.textContent = "";
+    if (err.code === "precondition-failed") {
+      showEditorError(`Cannot save \`${name}\`: it was changed on the server after you opened it`, true);
+    } else if (err.code === "upload-disabled") {
+      showEditorError(`Cannot save \`${name}\`: upload is disabled`);
+    } else if (err.code === "delete-disabled") {
+      showEditorError(`Cannot save \`${name}\`: delete is disabled`);
+    } else if (err.code === "readonly-descendant") {
+      showEditorError(`Cannot save \`${name}\`: it is read-only`);
+    } else if (err.status) {
+      showEditorError(`Cannot save \`${name}\`, ${err.status} ${err.body}`.trimEnd());
+    } else {
+      showEditorError(`Cannot save \`${name}\`, ${err.message}`);
+    }
+  } finally {
+    $saveBtn.disabled = false;
+    $overwriteBtn.disabled = false;
+    if (hadFocus || overwrite) $saveBtn.focus();
   }
+}
+
+/**
+ * Read the current ETag of the edited file, or null when it is unavailable.
+ * @returns {Promise<string|null>}
+ */
+async function fetchEtag() {
+  try {
+    const res = await fetch(baseUrl(), { method: "HEAD", cache: "no-store" });
+    return res.ok ? res.headers.get("etag") : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Show a save failure above the editor, keeping the editor content intact.
+ * @param {string} message
+ * @param {boolean} [conflict] offer to reload or overwrite
+ */
+function showEditorError(message, conflict = false) {
+  document.querySelector(".editor-error-text").textContent = message;
+  document.querySelector(".editor-error-actions").classList.toggle("hidden", !conflict);
+  document.querySelector(".editor-error").classList.remove("hidden");
+}
+
+function hideEditorError() {
+  document.querySelector(".editor-error").classList.add("hidden");
 }
 
 async function checkAuth(variant) {
@@ -1153,7 +1239,10 @@ function escapeHtml(rawStr) {
 
 async function assertResOK(res) {
   if (!(res.status >= 200 && res.status < 300)) {
-    const err = new Error(await res.text() || `Invalid status ${res.status}`);
+    const body = await res.text();
+    const err = new Error(body || `Invalid status ${res.status}`);
+    err.status = res.status;
+    err.body = body;
     err.code = res.headers.get("x-dufs-error-code");
     throw err;
   }
