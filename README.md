@@ -127,6 +127,8 @@ Serve a static website with index.html
 dufs --render-index
 ```
 
+> **Security note:** every other file is served with `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`, so uploaded HTML/SVG cannot script the dufs origin. `--render-index`, `--render-try-index` and `--render-spa` deliberately serve `index.html` *without* the sandbox header so the site can run its scripts. That page runs on the same origin as the dufs UI and API, so only use these flags when you trust whoever can write `index.html`.
+
 Require username/password
 
 ```
