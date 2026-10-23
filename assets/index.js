@@ -33,11 +33,6 @@ var DUFS_MAX_UPLOADINGS = 1;
 var DATA;
 
 /**
- * @type {string}
- */
-var DIR_EMPTY_NOTE;
-
-/**
  * @type {PARAMS}
  * @typedef {object} PARAMS
  * @property {string} q
@@ -95,6 +90,10 @@ let $emptyFolder;
 /**
  * @type Element
  */
+let $listingError;
+/**
+ * @type Element
+ */
 let $editor;
 /**
  * @type Element
@@ -126,7 +125,6 @@ async function initialize() {
   }
 
   DATA = JSON.parse(decodeBase64($indexData.innerHTML));
-  DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
 
   await ready();
 }
@@ -145,6 +143,7 @@ async function ready() {
   $pathsTableBody = document.querySelector(".paths-table tbody");
   $uploadersTable = document.querySelector(".uploaders-table");
   $emptyFolder = document.querySelector(".empty-folder");
+  $listingError = document.querySelector(".listing-error");
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
@@ -311,6 +310,7 @@ class Uploader {
       uploadOffset = parseInt(value) || 0;
     }
     this.uploadOffset = uploadOffset;
+    Uploader.runnings++;
     this.ajax();
   }
 
@@ -393,7 +393,11 @@ Uploader.queues = [];
 
 Uploader.runQueue = async () => {
   if (Uploader.runnings >= DUFS_MAX_UPLOADINGS) return;
-  if (Uploader.queues.length == 0) return;
+  if (Uploader.queues.length == 0) {
+    // Nothing is running or waiting: the queue has drained.
+    if (Uploader.runnings === 0) refreshListing();
+    return;
+  }
   Uploader.runnings++;
   let uploader = Uploader.queues.shift();
   if (!Uploader.auth) {
@@ -469,12 +473,13 @@ async function setupIndexPage() {
     setupSearch();
   }
 
-  renderPathsTableHead();
-  renderPathsTableBody();
-
+  $pathsTableBody.addEventListener("click", onPathsTableClick);
   if (DATA.user) {
     setupDownloadWithToken();
   }
+
+  renderPathsTableHead();
+  renderPathsTableBody();
 }
 
 /**
@@ -527,27 +532,129 @@ function renderPathsTableHead() {
 }
 
 /**
- * Render path table tbody
+ * The note shown instead of the paths table when there is nothing to list.
  */
-function renderPathsTableBody() {
-  if (DATA.paths && DATA.paths.length > 0) {
-    const len = DATA.paths.length;
-    if (len > 0) {
-      $pathsTable.classList.remove("hidden");
-    }
+function emptyNote() {
+  return PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
+}
+
+/**
+ * Remember which control inside the paths table has the keyboard focus, as the
+ * row's name and the control's position in the row.
+ * @returns {{name: string | null, slot: number} | null}
+ */
+function captureFocus() {
+  const active = document.activeElement;
+  if (!active || !$pathsTableBody.contains(active)) return null;
+  const row = active.closest("tr");
+  return { name: row.dataset.name, slot: rowControls(row).indexOf(active) };
+}
+
+/**
+ * @param {Element} row
+ * @returns {Element[]}
+ */
+function rowControls(row) {
+  return Array.from(row.querySelectorAll("a[href], button"));
+}
+
+/**
+ * Put the focus back on the control `focus` describes, or on the row's first
+ * control when the row has fewer. With no rows left, the empty-folder note
+ * takes the focus so it does not fall back to the page.
+ * @param {{name: string | null, slot: number} | null} focus
+ */
+function restoreFocus(focus) {
+  if (!focus) return;
+  if (DATA.paths.length === 0) {
+    $emptyFolder.focus({ preventScroll: true });
+    return;
+  }
+  const row = Array.from($pathsTableBody.rows).find(tr => tr.dataset.name === focus.name);
+  if (!row) return;
+  const controls = rowControls(row);
+  (controls[focus.slot] || controls[0])?.focus({ preventScroll: true });
+}
+
+/**
+ * Render path table tbody from DATA.paths, keeping the scroll position and the
+ * keyboard focus.
+ * @param {{name: string | null, slot: number} | null} [focus] where the focus
+ * goes afterwards; defaults to where it is now
+ */
+function renderPathsTableBody(focus = captureFocus()) {
+  const scrollY = window.scrollY;
+  $pathsTableBody.replaceChildren();
+  if (DATA.paths.length > 0) {
     // Show an action column when it is available for the current directory or
     // at least one entry. Rows without permission render the action disabled.
     const showMove =
       (DATA.allow_upload && DATA.allow_delete) ||
-      DATA.paths.some((p) => p?.allow_upload && p?.allow_delete);
+      DATA.paths.some((p) => p.allow_upload && p.allow_delete);
     const showDelete =
-      DATA.allow_delete || DATA.paths.some((p) => p?.allow_delete);
-    for (let i = 0; i < len; i++) {
-      addPath(DATA.paths[i], i, showMove, showDelete);
+      DATA.allow_delete || DATA.paths.some((p) => p.allow_delete);
+    for (const file of DATA.paths) {
+      addPath(file, showMove, showDelete);
     }
+    $pathsTable.classList.remove("hidden");
+    $emptyFolder.classList.add("hidden");
   } else {
-    $emptyFolder.textContent = DIR_EMPTY_NOTE;
+    $pathsTable.classList.add("hidden");
+    $emptyFolder.textContent = emptyNote();
     $emptyFolder.classList.remove("hidden");
+  }
+  window.scrollTo(window.scrollX, scrollY);
+  restoreFocus(focus);
+}
+
+/**
+ * Whether a refresh is running, and whether another one was asked for while it
+ * ran (the listing it fetched may predate that request).
+ */
+let listingRefresh = null;
+let listingStale = false;
+
+/**
+ * Fetch the listing again, with the page's sort and search, and render it.
+ * Calls made while a fetch is in flight collapse into one more fetch.
+ * @returns {Promise<void>}
+ */
+function refreshListing() {
+  if (listingRefresh) {
+    listingStale = true;
+    return listingRefresh;
+  }
+  listingRefresh = (async () => {
+    try {
+      do {
+        listingStale = false;
+        await fetchListing();
+      } while (listingStale);
+    } finally {
+      listingRefresh = null;
+    }
+  })();
+  return listingRefresh;
+}
+
+async function fetchListing() {
+  const params = new URLSearchParams({ json: "" });
+  for (const key of ["sort", "order", "q"]) {
+    if (key in PARAMS) params.set(key, PARAMS[key]);
+  }
+  try {
+    const res = await fetch(`${baseUrl()}?${params}`);
+    await assertResOK(res);
+    const data = await res.json();
+    if (!Array.isArray(data.paths)) throw new Error("Unexpected response");
+    DATA.paths = data.paths;
+    DATA.dir_exists = data.dir_exists;
+    $listingError.classList.add("hidden");
+    renderPathsTableBody();
+  } catch (err) {
+    // Leave the old listing in place.
+    $listingError.textContent = `Could not refresh the listing: ${err.message}`;
+    $listingError.classList.remove("hidden");
   }
 }
 
@@ -579,11 +686,10 @@ function deniedReason(file, action) {
 /**
  * Add pathitem
  * @param {PathItem} file
- * @param {number} index
  * @param {boolean} showMove
  * @param {boolean} showDelete
  */
-function addPath(file, index, showMove, showDelete) {
+function addPath(file, showMove, showDelete) {
   const escapedName = escapeHtml(file.name);
   let actionDelete = "";
   let actionDownload = "";
@@ -610,7 +716,7 @@ function addPath(file, index, showMove, showDelete) {
   const canEdit = !isDir && canMove;
   if (showMove) {
     if (canMove) {
-      actionMove = `<button type="button" onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename" aria-label="Move or rename ${escapedName}">${ICONS.move}</button>`;
+      actionMove = `<button type="button" data-action="move" class="action-btn" title="Move & Rename" aria-label="Move or rename ${escapedName}">${ICONS.move}</button>`;
     } else {
       actionMove = disabledAction(ICONS.move, `Cannot move: ${deniedReason(file, "move")}`);
     }
@@ -625,7 +731,7 @@ function addPath(file, index, showMove, showDelete) {
   if (showDelete) {
     if (file.allow_delete) {
       actionDelete = `
-    <button type="button" onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete" aria-label="Delete ${escapedName}">${ICONS.delete}</button>`;
+    <button type="button" data-action="delete" class="action-btn" title="Delete" aria-label="Delete ${escapedName}">${ICONS.delete}</button>`;
     } else {
       actionDelete = disabledAction(ICONS.delete, `Cannot delete: ${deniedReason(file, "delete")}`);
     }
@@ -649,7 +755,7 @@ function addPath(file, index, showMove, showDelete) {
   let sizeDisplay = isDir ? formatDirSize(file.size) : formatFileSize(file.size).join(" ");
 
   $pathsTableBody.insertAdjacentHTML("beforeend", `
-<tr id="addPath${index}">
+<tr data-name="${escapedName}">
   <td class="path cell-icon">
     ${getPathSvg(file.path_type)}
   </td>
@@ -703,30 +809,34 @@ async function setupAuth() {
   }
 }
 
+/**
+ * Download through a one-time token so the browser need not hold the
+ * credentials. One listener on the document covers the toolbar link and the
+ * rows, however often the rows are rendered.
+ */
 function setupDownloadWithToken() {
-  document.querySelectorAll("a.dlwt").forEach(link => {
-    link.addEventListener("click", async e => {
-      e.preventDefault();
-      try {
-        const link = e.currentTarget || e.target;
-        const originalHref = link.getAttribute("href");
-        const tokengenUrl = new URL(originalHref);
-        tokengenUrl.searchParams.set("tokengen", "");
-        const res = await fetch(tokengenUrl);
-        if (!res.ok) throw new Error("Failed to fetch token");
-        const token = await res.text();
-        const downloadUrl = new URL(originalHref);
-        downloadUrl.searchParams.set("token", token);
-        const tempA = document.createElement("a");
-        tempA.href = downloadUrl.toString();
-        tempA.download = "";
-        document.body.appendChild(tempA);
-        tempA.click();
-        document.body.removeChild(tempA);
-      } catch (err) {
-        alert(`Failed to download, ${err.message}`);
-      }
-    });
+  document.addEventListener("click", async e => {
+    const link = e.target.closest("a.dlwt");
+    if (!link) return;
+    e.preventDefault();
+    try {
+      const originalHref = link.getAttribute("href");
+      const tokengenUrl = new URL(originalHref);
+      tokengenUrl.searchParams.set("tokengen", "");
+      const res = await fetch(tokengenUrl);
+      if (!res.ok) throw new Error("Failed to fetch token");
+      const token = await res.text();
+      const downloadUrl = new URL(originalHref);
+      downloadUrl.searchParams.set("token", token);
+      const tempA = document.createElement("a");
+      tempA.href = downloadUrl.toString();
+      tempA.download = "";
+      document.body.appendChild(tempA);
+      tempA.click();
+      document.body.removeChild(tempA);
+    } catch (err) {
+      alert(`Failed to download, ${err.message}`);
+    }
   });
 }
 
@@ -852,21 +962,40 @@ async function setupEditorPage() {
 }
 
 /**
+ * Run the action of a row button.
+ * @param {MouseEvent} e
+ */
+function onPathsTableClick(e) {
+  const button = e.target.closest("button[data-action]");
+  if (!button) return;
+  const name = button.closest("tr").dataset.name;
+  if (button.dataset.action === "delete") {
+    deletePath(name);
+  } else if (button.dataset.action === "move") {
+    movePath(name);
+  }
+}
+
+/**
  * Delete path
- * @param {number} index
+ * @param {string} name
  * @returns
  */
-async function deletePath(index) {
-  const file = DATA.paths[index];
+async function deletePath(name) {
+  const file = DATA.paths.find(p => p.name === name);
   if (!file) return;
   await doDeletePath(file.name, newUrl(file.name), () => {
-    document.getElementById(`addPath${index}`)?.remove();
-    DATA.paths[index] = null;
-    if (!DATA.paths.find(v => !!v)) {
-      $pathsTable.classList.add("hidden");
-      $emptyFolder.textContent = DIR_EMPTY_NOTE;
-      $emptyFolder.classList.remove("hidden");
+    const index = DATA.paths.indexOf(file);
+    let focus = captureFocus();
+    if (focus?.name === name) {
+      // The focused row is going away: the next row (or the previous, for the
+      // last one) takes the focus on the same control.
+      const next = DATA.paths[index + 1] || DATA.paths[index - 1];
+      focus = { name: next?.name ?? null, slot: focus.slot };
     }
+    DATA.paths.splice(index, 1);
+    renderPathsTableBody(focus);
+    refreshListing();
   });
 }
 
@@ -892,11 +1021,11 @@ async function doDeletePath(name, url, cb) {
 
 /**
  * Move path
- * @param {number} index
+ * @param {string} name
  * @returns
  */
-async function movePath(index) {
-  const file = DATA.paths[index];
+async function movePath(name) {
+  const file = DATA.paths.find(p => p.name === name);
   if (!file) return;
   const fileUrl = newUrl(file.name);
   const newFileUrl = await doMovePath(fileUrl);

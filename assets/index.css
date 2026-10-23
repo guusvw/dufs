@@ -8,6 +8,7 @@
   --text-secondary: #5c5c5c;
   --text-tertiary: #586069;
   --text-accent: #0366d6;
+  --text-error: #b31d28;
   --svg-primary: #24292e;
   --svg-secondary: rgba(3, 47, 98, 0.5);
   --svg-tertiary: #24292e;
@@ -156,6 +157,11 @@ svg {
 
 .empty-folder {
   font-style: italic;
+}
+
+.listing-error {
+  color: var(--text-error);
+  padding: 0.5em 0;
 }
 
 .uploaders-table th,
@@ -668,6 +674,7 @@ button.toolbox-right,
        needs. Lightened for dark only; #586069 stays as the light colour. */
     --text-tertiary: #9aa4ad;
     --text-accent: #3191ff;
+    --text-error: #ff7b72;
     --svg-primary: #fff;
     --svg-secondary: #fff;
     --svg-tertiary: #ffffff99;
