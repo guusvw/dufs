@@ -113,6 +113,14 @@ let $emptyFolder;
 /**
  * @type Element
  */
+let $filterStatus;
+/**
+ * What the search field has typed so far; rows whose name lacks it are hidden.
+ */
+let filterText = "";
+/**
+ * @type Element
+ */
 let $editor;
 /**
  * @type Element
@@ -189,6 +197,7 @@ async function ready() {
   $pathsTableBody = document.querySelector(".paths-table tbody");
   $uploadersTable = document.querySelector(".uploaders-table");
   $emptyFolder = document.querySelector(".empty-folder");
+  $filterStatus = document.querySelector(".filter-status");
   $editor = document.querySelector(".editor");
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
@@ -583,7 +592,26 @@ function renderPathsTableHead() {
  * The note shown instead of the paths table when there is nothing to list.
  */
 function emptyNote() {
+  if (DATA.paths.length > 0) return 'No matches in this folder — press Enter to search subfolders';
   return PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
+}
+
+/**
+ * The entries of DATA.paths whose name contains the filter text, ignoring case.
+ * @returns {PathItem[]}
+ */
+function visiblePaths() {
+  const needle = filterText.trim().toLowerCase();
+  if (!needle) return DATA.paths;
+  return DATA.paths.filter(p => p.name.toLowerCase().includes(needle));
+}
+
+/**
+ * Say how many entries the filter leaves, for screen readers.
+ * @param {number} count
+ */
+function announceMatches(count) {
+  $filterStatus.textContent = count === 0 ? 'No matches' : count === 1 ? '1 match' : `${count} matches`;
 }
 
 /**
@@ -614,7 +642,7 @@ function rowControls(row) {
  */
 function restoreFocus(focus) {
   if (!focus) return;
-  if (DATA.paths.length === 0) {
+  if (visiblePaths().length === 0) {
     $emptyFolder.focus({ preventScroll: true });
     return;
   }
@@ -637,7 +665,8 @@ function renderPathsTableBody(focus = captureFocus()) {
   }
   const scrollY = window.scrollY;
   $pathsTableBody.replaceChildren();
-  if (DATA.paths.length > 0) {
+  const paths = visiblePaths();
+  if (paths.length > 0) {
     // Show an action column when it is available for the current directory or
     // at least one entry. Rows without permission render the action disabled.
     const showMove =
@@ -645,7 +674,7 @@ function renderPathsTableBody(focus = captureFocus()) {
       DATA.paths.some((p) => p.allow_upload && p.allow_delete);
     const showDelete =
       DATA.allow_delete || DATA.paths.some((p) => p.allow_delete);
-    for (const file of DATA.paths) {
+    for (const file of paths) {
       addPath(file, showMove, showDelete);
     }
     $pathsTable.classList.remove("hidden");
@@ -655,6 +684,7 @@ function renderPathsTableBody(focus = captureFocus()) {
     $emptyFolder.textContent = emptyNote();
     $emptyFolder.classList.remove("hidden");
   }
+  if (filterText.trim()) announceMatches(paths.length);
   window.scrollTo(window.scrollX, scrollY);
   syncSelection();
   restoreFocus(focus);
@@ -921,9 +951,39 @@ function setupSearch() {
     const qs = params.toString();
     location.href = qs ? `${baseUrl()}?${qs}` : baseUrl();
   });
+  const $search = document.getElementById("search");
   if (PARAMS.q) {
-    document.getElementById('search').value = PARAMS.q;
+    $search.value = PARAMS.q;
   }
+
+  // Typing narrows the rows of this folder; Enter (above) searches subfolders.
+  let debounce;
+  const applyFilter = () => {
+    clearTimeout(debounce);
+    filterText = $search.value;
+    renderPathsTableBody();
+    if (!filterText.trim()) {
+      $filterStatus.textContent = `Showing all ${DATA.paths.length} entries`;
+    }
+  };
+  $search.addEventListener("input", () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(applyFilter, 100);
+  });
+  $search.addEventListener("keydown", event => {
+    if (event.key !== "Escape" || !$search.value) return;
+    event.preventDefault();
+    $search.value = "";
+    applyFilter();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
+    const target = event.target;
+    if (target instanceof Element && target.closest("input, textarea, select, [contenteditable]")) return;
+    event.preventDefault();
+    $search.focus();
+    $search.select();
+  });
 }
 
 function setupUploadFile() {
@@ -1077,15 +1137,16 @@ async function deletePath(name) {
   const file = DATA.paths.find(p => p.name === name);
   if (!file) return;
   await doDeletePath(file.name, newUrl(file.name), () => {
-    const index = DATA.paths.indexOf(file);
+    const shown = visiblePaths();
+    const index = shown.indexOf(file);
     let focus = captureFocus();
     if (focus?.name === name) {
       // The focused row is going away: the next row (or the previous, for the
       // last one) takes the focus on the same control.
-      const next = DATA.paths[index + 1] || DATA.paths[index - 1];
+      const next = shown[index + 1] || shown[index - 1];
       focus = { name: next?.name ?? null, slot: focus.slot };
     }
-    DATA.paths.splice(index, 1);
+    DATA.paths.splice(DATA.paths.indexOf(file), 1);
     renderPathsTableBody(focus);
     refreshListing();
   }, file);
