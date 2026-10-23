@@ -365,8 +365,17 @@ button.toolbox-right,
 }
 
 .save-btn {
+  display: flex;
+  align-items: center;
   -webkit-user-select: none;
   user-select: none;
+}
+
+.save-dirty {
+  padding-left: 0.2em;
+  color: var(--text-accent);
+  font-size: 1.5em;
+  line-height: 1;
 }
 
 .save-btn:disabled {
