@@ -1966,22 +1966,60 @@ async fn write_atomic<R: AsyncRead + Unpin>(path: &Path, reader: &mut R) -> io::
         (Some(dir), Some(name)) => dir.join(part_file_name(&name.to_string_lossy())),
         _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
     };
-    let mut file = fs::OpenOptions::new()
+    let old_meta = fs::metadata(&target).await.ok();
+    if old_meta.is_some() {
+        // Replacing renames over the file, which only needs directory access, so
+        // check separately that the file itself may be written, as before.
+        fs::OpenOptions::new().write(true).open(&target).await?;
+    }
+    let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&part)
-        .await?;
+        .await
+    {
+        Ok(file) => file,
+        // A writable file in a read-only directory cannot get a sibling temp
+        // file; write it in place, not atomically, as before.
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied && old_meta.is_some() => {
+            let mut file = fs::File::create(&target).await?;
+            io::copy(reader, &mut file).await?;
+            return file.flush().await;
+        }
+        Err(err) => return Err(err),
+    };
     let mut guard = PartFileGuard(Some(part.clone()));
     io::copy(reader, &mut file).await?;
     file.flush().await?;
     file.sync_data().await?;
-    drop(file);
-    if let Ok(meta) = fs::metadata(&target).await {
-        fs::set_permissions(&part, meta.permissions()).await?;
+    if let Some(meta) = &old_meta {
+        copy_file_attrs(&file, meta).await?;
     }
+    drop(file);
     fs::rename(&part, &target).await?;
     guard.0 = None;
     Ok(())
+}
+
+/// Gives the replacement `file` the owner, group and mode of the file it
+/// replaces, without the setuid and setgid bits.
+#[cfg(unix)]
+async fn copy_file_attrs(file: &fs::File, old: &Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+    // Only a privileged process may hand the file to another owner; for anyone
+    // else the new file simply stays with the uploader.
+    match fchown(file, Some(old.uid()), Some(old.gid())) {
+        Err(err) if err.kind() != io::ErrorKind::PermissionDenied => return Err(err),
+        _ => {}
+    }
+    let mode = old.permissions().mode() & 0o7777 & !0o6000;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .await
+}
+
+#[cfg(not(unix))]
+async fn copy_file_attrs(file: &fs::File, old: &Metadata) -> io::Result<()> {
+    file.set_permissions(old.permissions()).await
 }
 
 fn part_file_name(name: &str) -> String {

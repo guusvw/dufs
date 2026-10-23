@@ -211,6 +211,8 @@ curl -C- -o file http://127.0.0.1:5000/file
 
 Uploads with `PUT` are atomic: the body is written to a hidden `.<name>.dufs-<id>.part` file next to the target and renamed over it once complete, so an interrupted upload leaves the existing file untouched (and nothing behind for a new one). Leftover `.part` files older than 24 hours are removed at startup.
 
+A replaced file is a new inode, so hard links to the old file are not preserved. The old owner, group and permissions are kept, except the setuid and setgid bits, which are dropped. An existing file that is not writable (for example mode `0444`) is not overwritten. If the file is writable but its directory is not, no temp file can be created, so that upload is written in place and is not atomic.
+
 Resumable uploads (`PATCH` appends to a file that already exists)
 
 ```sh

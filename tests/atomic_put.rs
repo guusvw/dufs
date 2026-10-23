@@ -218,6 +218,81 @@ fn overwrite_keeps_permissions(#[with(ARGS)] server: TestServer) -> Result<(), E
     Ok(())
 }
 
+/// Permission bits are not enforced for root, so those tests are skipped there.
+#[cfg(unix)]
+fn running_as_root(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let probe = dir.join("probe-owner");
+    fs::write(&probe, "").unwrap();
+    let uid = fs::metadata(&probe).unwrap().uid();
+    fs::remove_file(&probe).unwrap();
+    uid == 0
+}
+
+#[cfg(unix)]
+#[rstest]
+fn read_only_file_is_not_overwritten(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let target = server.path().join("test.txt");
+    let original = fs::read(&target)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+    let resp = fetch!(b"PUT", format!("{}test.txt", server.url()))
+        .body("new")
+        .send()?;
+    assert_ne!(resp.status(), 201);
+    assert_eq!(fs::read(&target)?, original);
+    assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o777, 0o444);
+    assert!(part_files(server.path()).is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn overwrite_drops_setuid(#[with(ARGS)] server: TestServer) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = server.path().join("test.txt");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o4755))?;
+    let resp = fetch!(b"PUT", format!("{}test.txt", server.url()))
+        .body("new")
+        .send()?;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(fs::read_to_string(&target)?, "new");
+    assert_eq!(fs::metadata(&target)?.permissions().mode() & 0o7777, 0o755);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[rstest]
+fn writable_file_in_read_only_dir_is_written_in_place(
+    #[with(ARGS)] server: TestServer,
+) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if running_as_root(server.path()) {
+        return Ok(());
+    }
+    let dir = server.path().join("locked");
+    fs::create_dir(&dir)?;
+    let target = dir.join("file.txt");
+    fs::write(&target, "old")?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o666))?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))?;
+    let inode = fs::metadata(&target)?.ino();
+    let resp = fetch!(b"PUT", format!("{}locked/file.txt", server.url()))
+        .body("new")
+        .send()?;
+    let result = (|| -> Result<(), Error> {
+        assert_eq!(resp.status(), 201);
+        assert_eq!(fs::read_to_string(&target)?, "new");
+        assert_eq!(fs::metadata(&target)?.ino(), inode);
+        Ok(())
+    })();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    result
+}
+
 #[rstest]
 fn stale_part_files_removed_at_startup(
     tmpdir: assert_fs::TempDir,
