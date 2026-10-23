@@ -216,14 +216,14 @@ class Uploader {
 
   upload() {
     const { idx, name, url } = this;
-    const encodedName = encodedStr(name);
+    const escapedName = escapeHtml(name);
     $uploadersTable.insertAdjacentHTML("beforeend", `
   <tr id="upload${idx}" class="uploader">
     <td class="path cell-icon">
       ${getPathSvg()}
     </td>
     <td class="path cell-name">
-      <a href="${url}">${encodedName}</a>
+      <a href="${escapeHtml(url)}">${escapedName}</a>
     </td>
     <td class="cell-status" id="uploadStatus${idx}"></td>
     <td class="cell-size" id="uploadSize${idx}"></td>
@@ -362,7 +362,15 @@ class Uploader {
   }
 
   fail(reason = "") {
-    this.$status.innerHTML = `<span title="${reason}">✗</span><span class="retry-btn" id="retry${this.idx}" title="Retry">↻</span>`;
+    const $reason = document.createElement("span");
+    $reason.setAttribute("title", reason);
+    $reason.textContent = "✗";
+    const $retry = document.createElement("span");
+    $retry.className = "retry-btn";
+    $retry.id = `retry${this.idx}`;
+    $retry.setAttribute("title", "Retry");
+    $retry.textContent = "↻";
+    this.$status.replaceChildren($reason, $retry);
     this.$speed.textContent = "";
     this.$eta.textContent = "";
     failUploaders.set(this.idx, this);
@@ -422,13 +430,14 @@ function addBreadcrumb(href, uri_prefix) {
       }
       path += encodeURIComponent(name);
     }
-    const encodedName = encodedStr(name);
+    const escapedName = escapeHtml(name);
+    const escapedPath = escapeHtml(path);
     if (i === 0) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${path}" title="Root"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`);
+      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${escapedPath}" title="Root"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M6.5 14.5v-3.505c0-.245.25-.495.5-.495h2c.25 0 .5.25.5.5v3.5a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5v-7a.5.5 0 0 0-.146-.354L13 5.793V2.5a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1.293L8.354 1.146a.5.5 0 0 0-.708 0l-6 6A.5.5 0 0 0 1.5 7.5v7a.5.5 0 0 0 .5.5h4a.5.5 0 0 0 .5-.5z"/></svg></a>`);
     } else if (i === len - 1) {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<b>${encodedName}</b>`);
+      $breadcrumb.insertAdjacentHTML("beforeend", `<b>${escapedName}</b>`);
     } else {
-      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${path}">${encodedName}</a>`);
+      $breadcrumb.insertAdjacentHTML("beforeend", `<a href="${escapedPath}">${escapedName}</a>`);
     }
     if (i !== len - 1) {
       $breadcrumb.insertAdjacentHTML("beforeend", `<span class="separator">/</span>`);
@@ -510,7 +519,7 @@ function renderPathsTableHead() {
     // The active column says so, for sighted and screen-reader users alike.
     const ariaSort = active ? `aria-sort="${sortDesc ? "descending" : "ascending"}"` : "";
     const cls = active ? " active" : "";
-    return `<th class="cell-${item.name}${cls}" ${item.props} ${ariaSort}><a href="?${qs}">${item.text}${icon}</a></th>`
+    return `<th class="cell-${item.name}${cls}" ${item.props} ${ariaSort}><a href="?${escapeHtml(qs)}">${item.text}${icon}</a></th>`
   }).join("\n")}
       <th class="cell-actions">Actions</th>
     </tr>
@@ -548,7 +557,8 @@ function renderPathsTableBody() {
  * @param {string} title
  */
 function disabledAction(icon, title) {
-  return `<span class="action-btn disabled" title="${title}" aria-disabled="true" role="button" aria-label="${title}">${icon}</span>`;
+  const escapedTitle = escapeHtml(title);
+  return `<span class="action-btn disabled" title="${escapedTitle}" aria-disabled="true" role="button" aria-label="${escapedTitle}">${icon}</span>`;
 }
 
 /**
@@ -574,39 +584,39 @@ function deniedReason(file, action) {
  * @param {boolean} showDelete
  */
 function addPath(file, index, showMove, showDelete) {
-  const encodedName = encodedStr(file.name);
-  let url = newUrl(file.name);
+  const escapedName = escapeHtml(file.name);
   let actionDelete = "";
   let actionDownload = "";
   let actionMove = "";
   let actionEdit = "";
   let actionView = "";
-  let isDir = file.path_type.endsWith("Dir");
+  const isDir = file.path_type.endsWith("Dir");
+  const url = newUrl(file.name) + (isDir ? "/" : "");
+  const escapedUrl = escapeHtml(url);
   if (isDir) {
-    url += "/";
     if (DATA.allow_archive) {
       actionDownload = `
       <div class="action-btn">
-        <a class="dlwt" href="${url}?zip" title="Download folder as a .zip file" download aria-label="Download ${encodedName} as a .zip file">${ICONS.download}</a>
+        <a class="dlwt" href="${escapedUrl}?zip" title="Download folder as a .zip file" download aria-label="Download ${escapedName} as a .zip file">${ICONS.download}</a>
       </div>`;
     }
   } else {
     actionDownload = `
     <div class="action-btn" >
-      <a class="dlwt" href="${url}" title="Download file" download aria-label="Download ${encodedName}">${ICONS.download}</a>
+      <a class="dlwt" href="${escapedUrl}" title="Download file" download aria-label="Download ${escapedName}">${ICONS.download}</a>
     </div>`;
   }
   const canMove = file.allow_upload && file.allow_delete;
   const canEdit = !isDir && canMove;
   if (showMove) {
     if (canMove) {
-      actionMove = `<button type="button" onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename" aria-label="Move or rename ${encodedName}">${ICONS.move}</button>`;
+      actionMove = `<button type="button" onclick="movePath(${index})" class="action-btn" id="moveBtn${index}" title="Move & Rename" aria-label="Move or rename ${escapedName}">${ICONS.move}</button>`;
     } else {
       actionMove = disabledAction(ICONS.move, `Cannot move: ${deniedReason(file, "move")}`);
     }
     if (!isDir) {
       if (canEdit) {
-        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${url}?edit" aria-label="Edit ${encodedName}">${ICONS.edit}</a>`;
+        actionEdit = `<a class="action-btn" title="Edit file" target="_blank" href="${escapedUrl}?edit" aria-label="Edit ${escapedName}">${ICONS.edit}</a>`;
       } else {
         actionEdit = disabledAction(ICONS.edit, `Cannot edit: ${deniedReason(file, "edit")}`);
       }
@@ -615,13 +625,13 @@ function addPath(file, index, showMove, showDelete) {
   if (showDelete) {
     if (file.allow_delete) {
       actionDelete = `
-    <button type="button" onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete" aria-label="Delete ${encodedName}">${ICONS.delete}</button>`;
+    <button type="button" onclick="deletePath(${index})" class="action-btn" id="deleteBtn${index}" title="Delete" aria-label="Delete ${escapedName}">${ICONS.delete}</button>`;
     } else {
       actionDelete = disabledAction(ICONS.delete, `Cannot delete: ${deniedReason(file, "delete")}`);
     }
   }
   if (!canEdit && !isDir) {
-    actionView = `<a class="action-btn" title="View file" target="_blank" href="${url}?view" aria-label="View ${encodedName}">${ICONS.view}</a>`;
+    actionView = `<a class="action-btn" title="View file" target="_blank" href="${escapedUrl}?view" aria-label="View ${escapedName}">${ICONS.view}</a>`;
   }
   // Every row gets the same five slots in the same order, so an action sits at
   // the same x on every row even when a row has fewer buttons (a folder has no
@@ -644,7 +654,7 @@ function addPath(file, index, showMove, showDelete) {
     ${getPathSvg(file.path_type)}
   </td>
   <td class="path cell-name">
-    <a href="${url}" ${isDir ? "" : `target="_blank"`}>${encodedName}</a>
+    <a href="${escapedUrl}" ${isDir ? "" : `target="_blank"`}>${escapedName}</a>
     <span class="path-meta">${formatMtime(file.mtime)} · ${sizeDisplay.trim()}</span>
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
@@ -812,7 +822,7 @@ async function setupEditorPage() {
     const url = baseUrl();
     const ext = extName(baseName(url));
     if (IFRAME_FORMATS.find(v => v === ext)) {
-      $notEditable.insertAdjacentHTML("afterend", `<iframe src="${url}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
+      $notEditable.insertAdjacentHTML("afterend", `<iframe src="${escapeHtml(url)}" sandbox width="100%" height="${window.innerHeight - 100}px"></iframe>`);
     } else {
       $notEditable.classList.remove("hidden");
       $notEditable.textContent = "Cannot edit because file is too large or binary.";
@@ -1129,10 +1139,14 @@ function formatPercent(percent) {
   return Math.round(percent) + "%";
 }
 
-function encodedStr(rawStr) {
-  return rawStr.replace(/[\u00A0-\u9999<>\&]/g, function (i) {
-    return '&#' + i.charCodeAt(0) + ';';
-  });
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
+/**
+ * Escape a string for use in HTML text and in quoted attribute values.
+ * @param {string} rawStr
+ */
+function escapeHtml(rawStr) {
+  return String(rawStr).replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
 }
 
 async function assertResOK(res) {
