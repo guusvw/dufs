@@ -65,6 +65,7 @@ Options:
       --allow-upload         Allow upload files/folders
       --allow-delete         Allow delete files/folders
       --allow-search         Allow search files/folders
+      --search-limit <count> Set the maximum number of search results [default: 1000]
       --allow-symlink        Allow symlink to files/folders outside root directory
       --allow-archive        Allow download folders as archive file
       --allow-hash           Allow ?hash query to get file sha256 hash
@@ -195,6 +196,8 @@ curl http://127.0.0.1:5000?q=Dockerfile           # search for files, similar to
 curl http://127.0.0.1:5000?simple                 # output names only, similar to `ls -1`
 curl http://127.0.0.1:5000?json                   # output paths in json format
 ```
+
+Search returns at most `--search-limit` results (default 1000); the json output then carries `"truncated": true`. Searches and archive downloads share a limited number of concurrent directory walks (one per CPU); when too many requests are waiting, the server answers `503` with a `Retry-After` header.
 
 With authorization (Both basic or digest auth works)
 
@@ -360,6 +363,7 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --allow-upload          DUFS_ALLOW_UPLOAD=true
     --allow-delete          DUFS_ALLOW_DELETE=true
     --allow-search          DUFS_ALLOW_SEARCH=true
+    --search-limit <count>  DUFS_SEARCH_LIMIT=1000
     --allow-symlink         DUFS_ALLOW_SYMLINK=true
     --allow-archive         DUFS_ALLOW_ARCHIVE=true
     --allow-hash            DUFS_ALLOW_HASH=true
@@ -398,6 +402,7 @@ allow-all: false
 allow-upload: true
 allow-delete: true
 allow-search: true
+search-limit: 1000
 allow-symlink: true
 allow-archive: true
 allow-hash: true

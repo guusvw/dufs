@@ -133,6 +133,15 @@ pub fn build_cli() -> Command {
                 .help("Allow search files/folders"),
         )
         .arg(
+            Arg::new("search-limit")
+                .env("DUFS_SEARCH_LIMIT")
+                .hide_env(true)
+                .long("search-limit")
+                .value_parser(value_parser!(u64).range(1..))
+                .value_name("count")
+                .help("Set the maximum number of search results [default: 1000]"),
+        )
+        .arg(
             Arg::new("allow-symlink")
                 .env("DUFS_ALLOW_SYMLINK")
 				.hide_env(true)
@@ -287,6 +296,9 @@ pub struct Args {
     pub allow_upload: bool,
     pub allow_delete: bool,
     pub allow_search: bool,
+    #[default(default_search_limit())]
+    #[serde(default = "default_search_limit")]
+    pub search_limit: usize,
     pub allow_symlink: bool,
     pub allow_archive: bool,
     pub allow_hash: bool,
@@ -381,6 +393,9 @@ impl Args {
         }
         if !args.allow_search {
             args.allow_search = allow_all || matches.get_flag("allow-search");
+        }
+        if let Some(limit) = matches.get_one::<u64>("search-limit") {
+            args.search_limit = usize::try_from(*limit).unwrap_or(usize::MAX);
         }
         if !args.allow_symlink {
             args.allow_symlink = allow_all || matches.get_flag("allow-symlink");
@@ -645,6 +660,10 @@ fn default_port() -> u16 {
     5000
 }
 
+fn default_search_limit() -> usize {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +756,24 @@ hidden: tmp,*.log,*.lock
         assert_eq!(args.hidden, ["tmp", "*.log", "*.lock"]);
         assert_eq!(args.port, 3000);
         assert!(args.allow_upload);
+    }
+
+    #[test]
+    fn test_search_limit() {
+        let cli = build_cli();
+        let matches = cli.try_get_matches_from(vec![""]).unwrap();
+        assert_eq!(Args::parse(matches).unwrap().search_limit, 1000);
+
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--search-limit", "25"])
+            .unwrap();
+        assert_eq!(Args::parse(matches).unwrap().search_limit, 25);
+
+        let cli = build_cli();
+        assert!(cli
+            .try_get_matches_from(vec!["", "--search-limit", "0"])
+            .is_err());
     }
 
     #[test]

@@ -237,6 +237,10 @@ impl TestServer {
     pub fn port(&self) -> u16 {
         self.port.num
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for TestServer {

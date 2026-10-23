@@ -77,6 +77,7 @@ applyTheme(loadTheme());
  * @property {string} user
  * @property {boolean} dir_exists
  * @property {string} editable
+ * @property {boolean} [truncated]
  */
 
 var DUFS_MAX_UPLOADINGS = 3;
@@ -931,6 +932,7 @@ function renderPathsTableBody(focus = captureFocus()) {
   }
   const scrollY = window.scrollY;
   $pathsTableBody.replaceChildren();
+  document.querySelector(".search-note")?.remove();
   const paths = visiblePaths();
   if (paths.length > 0) {
     // Show an action column when it is available for the current directory or
@@ -945,6 +947,13 @@ function renderPathsTableBody(focus = captureFocus()) {
     }
     $pathsTable.classList.remove("hidden");
     $emptyFolder.classList.add("hidden");
+    if (DATA.truncated) {
+      const $note = document.createElement("div");
+      $note.className = "search-note";
+      $note.setAttribute("role", "status");
+      $note.textContent = `Showing first ${DATA.paths.length} results`;
+      $pathsTable.after($note);
+    }
   } else {
     $pathsTable.classList.add("hidden");
     $emptyFolder.textContent = emptyNote();
