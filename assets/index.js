@@ -813,8 +813,6 @@ async function setupEditorPage() {
       $saveBtn.classList.remove("hidden");
       $saveBtn.addEventListener("click", saveChange);
     }
-  } else if (DATA.kind == "View") {
-    $editor.readonly = true;
   }
 
   if (!DATA.editable) {
@@ -831,7 +829,11 @@ async function setupEditorPage() {
   }
 
   $editor.classList.remove("hidden");
-  $editor.readonly = DATA.kind == "View" || !DATA.allow_upload;
+  const readOnly = DATA.kind == "View" || !DATA.allow_upload;
+  $editor.readOnly = readOnly;
+  if (readOnly) {
+    $editor.setAttribute("aria-label", "File contents (read-only)");
+  }
   try {
     const res = await fetch(baseUrl());
     await assertResOK(res);
