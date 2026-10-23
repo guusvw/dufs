@@ -67,7 +67,7 @@ const PART_FILE_INFIX: &str = ".dufs-";
 const PART_FILE_SUFFIX: &str = ".part";
 const UPLOAD_ID_HEADER: &str = "x-dufs-upload-id";
 const UPLOAD_OFFSET_HEADER: &str = "x-dufs-upload-offset";
-const PART_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const PART_SWEEP_MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PART_FILE_NAME_MAX_LEN: usize = 200;
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
@@ -623,10 +623,16 @@ impl Server {
             (None, None) => {
                 let target = resolve_write_target(path).await?;
                 let part = part_path(&target, &Uuid::new_v4().simple().to_string())?;
-                let file = create_part_file(&part).await?;
-                let mut guard = PartFileGuard(Some(part.clone()));
-                commit_part_file(file, &part, &target, &mut body_reader).await?;
-                guard.0 = None;
+                // Keeps the sweep from removing the part file of a slow upload.
+                let _active = self.claim_upload(&part);
+                match create_part_file(&part, &target).await? {
+                    Some(file) => {
+                        let mut guard = PartFileGuard(Some(part.clone()));
+                        commit_part_file(file, &part, &target, &mut body_reader).await?;
+                        guard.0 = None;
+                    }
+                    None => write_in_place(&target, &mut body_reader).await?,
+                }
                 StatusCode::CREATED
             }
             (None, Some(id)) => {
@@ -639,8 +645,14 @@ impl Server {
                     DufsErrorCode::UploadIdInUse.respond(res);
                     return Ok(());
                 };
-                let file = match create_part_file(&part).await {
-                    Ok(file) => file,
+                let file = match create_part_file(&part, &target).await {
+                    Ok(Some(file)) => file,
+                    // Nothing is kept on disk to resume from.
+                    Ok(None) => {
+                        write_in_place(&target, &mut body_reader).await?;
+                        *res.status_mut() = StatusCode::CREATED;
+                        return Ok(());
+                    }
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                         DufsErrorCode::UploadIdInUse.respond(res);
                         return Ok(());
@@ -709,6 +721,7 @@ impl Server {
             insert_upload_offset(res, received);
             return Ok(());
         }
+        ensure_target_writable(&target).await?;
         let file = fs::OpenOptions::new().append(true).open(&part).await?;
         let stream = IncomingStream::new(req.into_body());
         let body_with_io_error = stream.map_err(io::Error::other);
@@ -735,6 +748,55 @@ impl Server {
                     .typed_insert(CacheControl::new().with_no_cache());
             }
             None => DufsErrorCode::UploadNotFound.respond(res),
+        }
+    }
+
+    /// Removes upload temp files, now and then hourly (or every half TTL if
+    /// that is shorter), until the server stops. Files left by a crash or by a
+    /// client that never came back are older than the TTL by then.
+    pub fn spawn_part_sweep(self: &Arc<Self>) {
+        let server = self.clone();
+        let interval = (server.args.upload_part_ttl / 2).min(PART_SWEEP_MAX_INTERVAL);
+        tokio::spawn(async move {
+            while server.running.load(atomic::Ordering::SeqCst) {
+                let sweeper = server.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || sweeper.remove_stale_part_files()).await;
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// Removes the part files under the served directory that are older than
+    /// the TTL and that no request is writing.
+    fn remove_stale_part_files(&self) {
+        let ttl = self.args.upload_part_ttl;
+        let now = SystemTime::now();
+        for entry in WalkDir::new(&self.args.serve_path)
+            .into_iter()
+            .filter_map(|v| v.ok())
+        {
+            if !entry.file_type().is_file() || !is_part_file(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|v| v.modified().ok())
+                .and_then(|v| now.duration_since(v).ok())
+                .is_some_and(|age| age > ttl);
+            if !stale {
+                continue;
+            }
+            // Hold the lock across the removal so that a request cannot claim
+            // the part file in between.
+            let active = self
+                .active_uploads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !active.contains(entry.path()) && std::fs::remove_file(entry.path()).is_ok() {
+                warn!("Removed stale upload file `{}`", entry.path().display());
+            }
         }
     }
 
@@ -2288,12 +2350,39 @@ fn part_path(target: &Path, id: &str) -> io::Result<PathBuf> {
     }
 }
 
-async fn create_part_file(part: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
+/// Fails unless an existing `target` may be written. Replacing a file by
+/// renaming only needs access to its directory, so this keeps read-only files
+/// from being overwritten. Returns whether `target` exists.
+async fn ensure_target_writable(target: &Path) -> io::Result<bool> {
+    if fs::metadata(target).await.is_err() {
+        return Ok(false);
+    }
+    fs::OpenOptions::new().write(true).open(target).await?;
+    Ok(true)
+}
+
+/// Creates the part file for replacing `target`. Returns `None` if the file
+/// is writable but its directory is not, so no part file can be made and the
+/// request has to write `target` in place.
+async fn create_part_file(part: &Path, target: &Path) -> io::Result<Option<fs::File>> {
+    let exists = ensure_target_writable(target).await?;
+    match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(part)
         .await
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied && exists => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Overwrites `target` in place, without the safety of a part file.
+async fn write_in_place<R: AsyncRead + Unpin>(target: &Path, reader: &mut R) -> io::Result<()> {
+    let mut file = fs::File::create(target).await?;
+    io::copy(reader, &mut file).await?;
+    file.flush().await
 }
 
 /// Writes `reader` to the open part file and renames it over `target` once
@@ -2311,11 +2400,32 @@ async fn commit_part_file<R: AsyncRead + Unpin>(
     file.flush().await?;
     copied?;
     file.sync_data().await?;
-    drop(file);
     if let Ok(meta) = fs::metadata(target).await {
-        fs::set_permissions(part, meta.permissions()).await?;
+        copy_file_attrs(&file, &meta).await?;
     }
+    drop(file);
     fs::rename(part, target).await
+}
+
+/// Gives the replacement `file` the owner, group and mode of the file it
+/// replaces, without the setuid and setgid bits.
+#[cfg(unix)]
+async fn copy_file_attrs(file: &fs::File, old: &Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+    // Only a privileged process may hand the file to another owner; for anyone
+    // else the new file simply stays with the uploader.
+    match fchown(file, Some(old.uid()), Some(old.gid())) {
+        Err(err) if err.kind() != io::ErrorKind::PermissionDenied => return Err(err),
+        _ => {}
+    }
+    let mode = old.permissions().mode() & 0o7777 & !0o6000;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .await
+}
+
+#[cfg(not(unix))]
+async fn copy_file_attrs(file: &fs::File, old: &Metadata) -> io::Result<()> {
+    file.set_permissions(old.permissions()).await
 }
 
 fn part_file_name(name: &str, id: &str) -> String {
@@ -2350,26 +2460,6 @@ async fn received_len(path: &Path, id: &str) -> Option<u64> {
     let part = part_path(&target, id).ok()?;
     let meta = fs::metadata(part).await.ok()?;
     meta.is_file().then_some(meta.len())
-}
-
-/// Removes upload temp files left behind by a crash or kill, once they are old
-/// enough that no running upload can still own them.
-pub fn remove_stale_part_files(root: &Path) {
-    let now = SystemTime::now();
-    for entry in WalkDir::new(root).into_iter().filter_map(|v| v.ok()) {
-        if !entry.file_type().is_file() || !is_part_file(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|v| v.modified().ok())
-            .and_then(|v| now.duration_since(v).ok())
-            .is_some_and(|age| age > PART_FILE_MAX_AGE);
-        if stale && std::fs::remove_file(entry.path()).is_ok() {
-            warn!("Removed stale upload file `{}`", entry.path().display());
-        }
-    }
 }
 
 async fn ensure_path_parent(path: &Path) -> Result<()> {

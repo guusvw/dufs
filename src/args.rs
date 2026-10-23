@@ -8,6 +8,7 @@ use smart_default::SmartDefault;
 use std::env;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::auth::{load_token_secret, AccessControl};
 use crate::http_logger::HttpLogger;
@@ -251,6 +252,15 @@ pub fn build_cli() -> Command {
                 .help("Path to the secret that signs share tokens, created if missing"),
         )
         .arg(
+            Arg::new("upload-part-ttl")
+                .env("DUFS_UPLOAD_PART_TTL")
+                .hide_env(true)
+                .long("upload-part-ttl")
+                .value_name("duration")
+                .value_parser(parse_duration)
+                .help("Remove unfinished upload files after this long, e.g. 90m, 24h, 7d [default: 24h]"),
+        )
+        .arg(
             Arg::new("completions")
                 .long("completions")
                 .value_name("shell")
@@ -334,6 +344,9 @@ pub struct Args {
     #[serde(default = "default_shutdown_timeout")]
     #[default(default_shutdown_timeout())]
     pub shutdown_timeout: u64,
+    #[serde(deserialize_with = "deserialize_duration")]
+    #[default(DEFAULT_UPLOAD_PART_TTL)]
+    pub upload_part_ttl: Duration,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub token_secret_file: Option<PathBuf>,
@@ -469,6 +482,10 @@ impl Args {
 
         if let Some(shutdown_timeout) = matches.get_one::<u64>("shutdown-timeout") {
             args.shutdown_timeout = *shutdown_timeout;
+        }
+
+        if let Some(ttl) = matches.get_one::<Duration>("upload-part-ttl") {
+            args.upload_part_ttl = *ttl;
         }
 
         #[cfg(feature = "tls")]
@@ -676,6 +693,45 @@ where
     value.parse().map_err(serde::de::Error::custom)
 }
 
+/// How long an unfinished upload's temp file is kept by default.
+const DEFAULT_UPLOAD_PART_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Parses a positive duration like `500ms`, `30s`, `90m`, `24h` or `7d`. A
+/// number without a unit is in seconds.
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (num, unit) = value.split_at(split);
+    let num: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration `{value}`, expected e.g. 90m, 24h or 7d"))?;
+    let millis_per_unit: u64 = match unit {
+        "ms" => 1,
+        "" | "s" => 1000,
+        "m" => 60 * 1000,
+        "h" => 60 * 60 * 1000,
+        "d" => 24 * 60 * 60 * 1000,
+        _ => return Err(format!("invalid duration unit `{unit}` in `{value}`")),
+    };
+    let millis = num
+        .checked_mul(millis_per_unit)
+        .ok_or_else(|| format!("duration `{value}` is too large"))?;
+    if millis == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: String = Deserialize::deserialize(deserializer)?;
+    parse_duration(&value).map_err(serde::de::Error::custom)
+}
+
 fn default_serve_path() -> PathBuf {
     PathBuf::from(".")
 }
@@ -708,6 +764,45 @@ mod tests {
     use assert_fs::prelude::*;
 
     #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("250ms"), Ok(Duration::from_millis(250)));
+        assert_eq!(parse_duration("30"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("90m"), Ok(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("24h"), Ok(Duration::from_secs(86400)));
+        assert_eq!(parse_duration("7d"), Ok(Duration::from_secs(604800)));
+        for bad in [
+            "",
+            "h",
+            "0",
+            "0h",
+            "-1h",
+            "1.5h",
+            "1w",
+            "1 h",
+            "99999999999999999d",
+        ] {
+            assert!(parse_duration(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_upload_part_ttl_from_config_and_cli() {
+        let args: Args = serde_saphyr::from_str("upload-part-ttl: 90m").unwrap();
+        assert_eq!(args.upload_part_ttl, Duration::from_secs(5400));
+        assert!(serde_saphyr::from_str::<Args>("upload-part-ttl: 0").is_err());
+        let cli = build_cli();
+        let matches = cli
+            .try_get_matches_from(vec!["", "--upload-part-ttl", "2h"])
+            .unwrap();
+        let args = Args::parse(matches).unwrap();
+        assert_eq!(args.upload_part_ttl, Duration::from_secs(7200));
+        assert!(build_cli()
+            .try_get_matches_from(vec!["", "--upload-part-ttl", "soon"])
+            .is_err());
+    }
+
+    #[test]
     fn test_default() {
         let cli = build_cli();
         let matches = cli.try_get_matches_from(vec![""]).unwrap();
@@ -716,6 +811,7 @@ mod tests {
         assert_eq!(args.serve_path, cwd);
         assert_eq!(args.port, default_port());
         assert_eq!(args.addrs, default_addrs());
+        assert_eq!(args.upload_part_ttl, DEFAULT_UPLOAD_PART_TTL);
     }
 
     #[test]
