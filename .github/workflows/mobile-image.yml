@@ -1,11 +1,13 @@
 ---
 # Builds this fork's UI as a container image so a deployment can pin it by
-# digest (vps-infra consumes ghcr.io/guusvw/dufs:mobile).
+# digest. feat/all-improvements (every UI and server fix combined) publishes
+# ghcr.io/guusvw/dufs:all-improvements, which vps-infra consumes; the other
+# branches keep the rolling :mobile tag.
 name: mobile-image
 
 on:
   push:
-    branches: [main, feat/mobile-layout]
+    branches: [main, feat/mobile-layout, feat/all-improvements]
     paths:
       - 'assets/**'
       - 'src/**'
@@ -43,7 +45,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/guusvw/dufs:mobile
+          tags: ghcr.io/guusvw/dufs:${{ github.ref_name == 'feat/all-improvements' && 'all-improvements' || 'mobile' }}
           provenance: false
 
       - run: echo "ghcr.io/guusvw/dufs@${{ steps.build.outputs.digest }}" >>"$GITHUB_STEP_SUMMARY"
