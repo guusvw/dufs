@@ -3,7 +3,7 @@
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
 use crate::error::{respond_io_error, DufsErrorCode};
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
-use crate::noscript::{detect_noscript, generate_noscript_html};
+use crate::noscript::{detect_noscript, generate_noscript_html, NOSCRIPT_CSP};
 use crate::utils::{
     coalesce_ranges, decode_uri, encode_uri, get_file_name, glob, join_within, parse_range,
     try_get_file_name,
@@ -59,7 +59,7 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
 const INDEX_JS: &str = include_str!("../assets/index.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
-const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'";
+pub(crate) const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self'; form-action 'self'";
 const INDEX_NAME: &str = "index.html";
 pub(crate) const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
@@ -1815,7 +1815,10 @@ impl Server {
         } else if has_query_flag(query_params, "noscript") {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-            set_ui_csp(res);
+            res.headers_mut().insert(
+                CONTENT_SECURITY_POLICY,
+                HeaderValue::from_str(&NOSCRIPT_CSP)?,
+            );
             generate_noscript_html(&data)?
         } else {
             res.headers_mut()

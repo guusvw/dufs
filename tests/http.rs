@@ -342,7 +342,6 @@ const UI_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; i
 fn ui_pages_have_csp(server: TestServer) -> Result<(), Error> {
     for url in [
         server.url().to_string(),
-        format!("{}?noscript", server.url()),
         format!("{}index.html?edit", server.url()),
         format!("{}index.html?view", server.url()),
     ] {
@@ -354,6 +353,37 @@ fn ui_pages_have_csp(server: TestServer) -> Result<(), Error> {
             "{url}"
         );
     }
+    Ok(())
+}
+
+/// The noscript page keeps its one inline stylesheet: the policy allows exactly
+/// that block by hash and is otherwise the strict UI policy.
+#[rstest]
+fn noscript_csp_allows_only_its_own_style(server: TestServer) -> Result<(), Error> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let resp = fetch!(b"GET", format!("{}?noscript", server.url())).send()?;
+    assert_eq!(resp.status(), 200);
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()?
+        .to_string();
+    let body = resp.text()?;
+    let start = body.find("<style>").unwrap() + "<style>".len();
+    let end = body.find("</style>").unwrap();
+    let hash = base64::engine::general_purpose::STANDARD
+        .encode(sha2::Sha256::digest(&body.as_bytes()[start..end]));
+    assert_eq!(
+        csp,
+        UI_CSP.replace(
+            "style-src 'self'",
+            &format!("style-src 'self' 'sha256-{hash}'")
+        )
+    );
+    assert_eq!(body.matches("<style>").count(), 1);
+    assert!(!body.contains("style=\""));
     Ok(())
 }
 

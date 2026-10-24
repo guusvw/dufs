@@ -15,6 +15,34 @@ pub fn detect_noscript(user_agent: &str) -> bool {
     .any(|v| user_agent.starts_with(v))
 }
 
+/// The noscript page's only stylesheet. Kept inline (the page must work without
+/// fetching assets) and allowed by its hash in [`NOSCRIPT_CSP`], so the strict
+/// UI policy still forbids any other inline style.
+const NOSCRIPT_STYLE: &str = r#"
+  td {
+    padding: 0.2rem;
+    text-align: left;
+  }
+  td:nth-child(3) {
+    text-align: right;
+  }
+"#;
+
+lazy_static::lazy_static! {
+    /// The UI policy with `style-src` widened by exactly the hash of [`NOSCRIPT_STYLE`].
+    pub static ref NOSCRIPT_CSP: String = {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let hash = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(NOSCRIPT_STYLE.as_bytes()));
+        crate::server::UI_CSP.replacen(
+            "style-src 'self'",
+            &format!("style-src 'self' 'sha256-{hash}'"),
+            1,
+        )
+    };
+}
+
 pub fn generate_noscript_html(data: &IndexData) -> Result<String> {
     let mut html = String::new();
 
@@ -23,18 +51,7 @@ pub fn generate_noscript_html(data: &IndexData) -> Result<String> {
     html.push_str("<html>\n");
     html.push_str("<head>\n");
     html.push_str(&format!("<title>{title}</title>\n"));
-    html.push_str(
-        r#"<style>
-  td {
-    padding: 0.2rem;
-    text-align: left;
-  }
-  td:nth-child(3) {
-    text-align: right;
-  }
-</style>
-"#,
-    );
+    html.push_str(&format!("<style>{NOSCRIPT_STYLE}</style>\n"));
     html.push_str("</head>\n");
     html.push_str("<body>\n");
     html.push_str(&format!("<h1>{title}</h1>\n"));
