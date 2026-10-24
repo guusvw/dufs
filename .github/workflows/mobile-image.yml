@@ -46,6 +46,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/guusvw/dufs:${{ github.ref_name == 'feat/all-improvements' && 'all-improvements' || 'mobile' }}
+          build-args: DUFS_COMMIT=${{ github.sha }}
           provenance: false
 
       - run: echo "ghcr.io/guusvw/dufs@${{ steps.build.outputs.digest }}" >>"$GITHUB_STEP_SUMMARY"

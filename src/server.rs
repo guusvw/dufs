@@ -1,8 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
-use crate::error::{respond_io_error, DufsErrorCode};
-use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
+use crate::error::{respond_io_error, DufsErrorCode, ERROR_CODE_HEADER};
+use crate::http_logger::Access;
+use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream, RequestStats};
+use crate::logger;
+use crate::metrics::{Gauge, UploadResult, WalkKind, WalkResult, METRICS};
 use crate::noscript::{detect_noscript, generate_noscript_html, NOSCRIPT_CSP};
 use crate::utils::{
     coalesce_ranges, decode_uri, encode_uri, get_file_name, glob, join_within, parse_range,
@@ -22,7 +25,7 @@ use headers::{
     IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
-use hyper::body::Frame;
+use hyper::body::{Body, Frame};
 use hyper::{
     body::Incoming,
     header::{
@@ -32,6 +35,7 @@ use hyper::{
     Method, StatusCode, Uri,
 };
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -42,7 +46,7 @@ use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::{fs, io};
@@ -124,35 +128,97 @@ impl Server {
 
     pub async fn call(
         self: Arc<Self>,
-        req: Request,
+        mut req: Request,
         addr: Option<SocketAddr>,
     ) -> Result<Response, hyper::Error> {
+        let started = Instant::now();
         let uri = req.uri().clone();
+        let method = req.method().clone();
+        let stats = Arc::new(RequestStats::default());
+        req.extensions_mut().insert(stats.clone());
+        // Probes run every few seconds; they would drown out the real traffic
+        // in the metrics and, if asked to, in the log.
+        let is_health = matches!(method, Method::GET | Method::HEAD)
+            && self.resolve_path(uri.path()).as_deref() == Some(HEALTH_CHECK_PATH);
+        let _in_flight = (!is_health).then(|| METRICS.track_in_flight());
         let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
-        let mut http_log_data = self.args.http_logger.data(&req);
-        if let Some(addr) = addr {
-            http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
-        }
+        let http_log_data = self.args.http_logger.data(&req);
 
-        let mut res = match self.clone().handle(req).await {
-            Ok(res) => {
-                http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
-                if !uri.path().starts_with(assets_prefix) {
-                    self.args.http_logger.log(&http_log_data, None);
-                }
-                res
-            }
+        let (mut res, err) = match self.clone().handle(req).await {
+            Ok(res) => (res, None),
             Err(err) => {
                 let mut res = Response::default();
                 respond_io_error(&err, &mut res);
-                http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
-                self.args
-                    .http_logger
-                    .log(&http_log_data, Some(err.to_string()));
-                res
+                (res, Some(err))
             }
         };
+
+        // A client that left in the middle of its upload is no server error;
+        // like nginx, count and log that as 499.
+        let status = match res.status() {
+            status
+                if status.is_server_error()
+                    && stats.body_failed.load(atomic::Ordering::Relaxed) =>
+            {
+                StatusCode::from_u16(499).unwrap_or(status)
+            }
+            status => status,
+        };
+        let elapsed = started.elapsed();
+        if !is_health {
+            METRICS.observe_request(&method, status, elapsed);
+            // An upload that was turned away before any data was taken.
+            let turned_away = (status.is_client_error() && status != StatusCode::UNAUTHORIZED)
+                || status == StatusCode::SERVICE_UNAVAILABLE;
+            if matches!(method, Method::PUT | Method::PATCH)
+                && turned_away
+                && !stats.upload_counted.load(atomic::Ordering::Relaxed)
+            {
+                METRICS.count_upload(UploadResult::Refused);
+            }
+        }
+
+        let skip = match err {
+            Some(_) => false,
+            None => {
+                (is_health && status == StatusCode::OK && self.args.log_skip_health)
+                    || uri.path().starts_with(assets_prefix)
+            }
+        };
+        if !skip {
+            let header = |name: &str| {
+                res.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            let upload_id = form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+                .find_map(|(k, v)| (k == "upload" && is_upload_id(&v)).then(|| v.to_string()))
+                .or_else(|| header(UPLOAD_ID_HEADER));
+            let io_kind = match &err {
+                Some(err) => io_error_of(err).map(|e| format!("{:?}", e.kind())),
+                None => stats
+                    .io_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(kind, _)| kind.clone()),
+            };
+            let access = Access {
+                remote_addr: addr.map(|addr| addr.ip().to_string()),
+                status: status.as_u16(),
+                duration: elapsed,
+                bytes_sent: body_len(&res),
+                bytes_received: stats.bytes_received.load(atomic::Ordering::Relaxed),
+                error_code: header(ERROR_CODE_HEADER),
+                upload_id,
+                io_kind,
+            };
+            self.args
+                .http_logger
+                .log(&http_log_data, &access, err.map(|e| e.to_string()));
+        }
 
         if enable_cors {
             add_cors(&mut res);
@@ -613,8 +679,26 @@ impl Server {
         req: Request,
         res: &mut Response,
     ) -> Result<()> {
+        let meter = UploadMeter::start(RequestStats::of(&req), upload_id, false);
+        let ret = self
+            .store_upload(path, upload_offset, upload_id, size, req, res)
+            .await;
+        meter.finish(&ret, res);
+        ret
+    }
+
+    async fn store_upload(
+        &self,
+        path: &Path,
+        upload_offset: Option<u64>,
+        upload_id: Option<&str>,
+        size: u64,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let stats = RequestStats::of(&req);
         ensure_path_parent(path).await?;
-        let stream = IncomingStream::new(req.into_body());
+        let stream = IncomingStream::new(req.into_body(), stats.clone());
         let body_with_io_error = stream.map_err(io::Error::other);
         let body_reader = StreamReader::new(body_with_io_error);
         pin_mut!(body_reader);
@@ -660,7 +744,7 @@ impl Server {
                     Err(err) => return Err(err.into()),
                 };
                 if let Err(err) = commit_part_file(file, &part, &target, &mut body_reader).await {
-                    respond_upload_failed(res, id, &err);
+                    respond_upload_failed(res, id, &err, &stats);
                     return Ok(());
                 }
                 StatusCode::CREATED
@@ -692,6 +776,20 @@ impl Server {
         req: Request,
         res: &mut Response,
     ) -> Result<()> {
+        let meter = UploadMeter::start(RequestStats::of(&req), Some(id), true);
+        let ret = self.resume_upload(path, id, req, res).await;
+        meter.finish(&ret, res);
+        ret
+    }
+
+    async fn resume_upload(
+        &self,
+        path: &Path,
+        id: &str,
+        req: Request,
+        res: &mut Response,
+    ) -> Result<()> {
+        let stats = RequestStats::of(&req);
         let offset = match parse_resume_offset(req.headers()) {
             Ok(Some(v)) => v,
             Ok(None) => {
@@ -723,12 +821,12 @@ impl Server {
         }
         ensure_target_writable(&target).await?;
         let file = fs::OpenOptions::new().append(true).open(&part).await?;
-        let stream = IncomingStream::new(req.into_body());
+        let stream = IncomingStream::new(req.into_body(), stats.clone());
         let body_with_io_error = stream.map_err(io::Error::other);
         let body_reader = StreamReader::new(body_with_io_error);
         pin_mut!(body_reader);
         if let Err(err) = commit_part_file(file, &part, &target, &mut body_reader).await {
-            respond_upload_failed(res, id, &err);
+            respond_upload_failed(res, id, &err, &stats);
             return Ok(());
         }
         status_no_content(res);
@@ -770,8 +868,10 @@ impl Server {
     /// Removes the part files under the served directory that are older than
     /// the TTL and that no request is writing.
     fn remove_stale_part_files(&self) {
+        let started = Instant::now();
         let ttl = self.args.upload_part_ttl;
         let now = SystemTime::now();
+        let (mut removed, mut remaining, mut remaining_bytes) = (0u64, 0u64, 0u64);
         for entry in WalkDir::new(&self.args.serve_path)
             .into_iter()
             .filter_map(|v| v.ok())
@@ -779,24 +879,44 @@ impl Server {
             if !entry.file_type().is_file() || !is_part_file(&entry.file_name().to_string_lossy()) {
                 continue;
             }
-            let stale = entry
-                .metadata()
-                .ok()
+            let meta = entry.metadata().ok();
+            let stale = meta
+                .as_ref()
                 .and_then(|v| v.modified().ok())
                 .and_then(|v| now.duration_since(v).ok())
                 .is_some_and(|age| age > ttl);
-            if !stale {
-                continue;
+            if stale {
+                // Hold the lock across the removal so that a request cannot
+                // claim the part file in between.
+                let active = self
+                    .active_uploads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !active.contains(entry.path()) && std::fs::remove_file(entry.path()).is_ok() {
+                    warn!("Removed stale upload file `{}`", entry.path().display());
+                    removed += 1;
+                    continue;
+                }
             }
-            // Hold the lock across the removal so that a request cannot claim
-            // the part file in between.
-            let active = self
-                .active_uploads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !active.contains(entry.path()) && std::fs::remove_file(entry.path()).is_ok() {
-                warn!("Removed stale upload file `{}`", entry.path().display());
-            }
+            remaining += 1;
+            remaining_bytes += meta.map_or(0, |v| v.len());
+        }
+        METRICS.set_part_files(remaining, remaining_bytes);
+        METRICS.add_part_files_swept(removed);
+        if removed > 0 {
+            logger::event(
+                log::Level::Info,
+                "part_sweep",
+                &format!(
+                    "Removed {removed} stale upload files, {remaining} remain ({remaining_bytes} bytes)"
+                ),
+                vec![
+                    ("removed", removed.into()),
+                    ("remaining", remaining.into()),
+                    ("remaining_bytes", remaining_bytes.into()),
+                    ("duration_ms", (started.elapsed().as_millis() as u64).into()),
+                ],
+            );
         }
     }
 
@@ -929,6 +1049,7 @@ impl Server {
                 respond_busy(res);
                 return Ok(());
             };
+            let mut meter = WalkMeter::new(WalkKind::Search);
             let prefix = self.relative_parts(path);
             let limit = self.args.search_limit;
 
@@ -959,6 +1080,14 @@ impl Server {
                     paths.push(item);
                 }
             }
+            meter.entries = paths.len() as u64;
+            meter.finish(if truncated {
+                WalkResult::Truncated
+            } else if search_paths.interrupted() {
+                WalkResult::Cancelled
+            } else {
+                WalkResult::Complete
+            });
         }
         self.send_index(
             path,
@@ -2518,8 +2647,9 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     follow_symlinks: bool,
     serve_path: PathBuf,
     running: Arc<AtomicBool>,
-    permit: OwnedSemaphorePermit,
+    permit: WalkPermit,
 ) -> Result<()> {
+    let mut meter = WalkMeter::new(WalkKind::Zip);
     // Entries are zipped while the walk is still going, so the first bytes
     // reach the client without waiting for the whole tree to be scanned.
     let mut zip_paths = start_walk(
@@ -2553,6 +2683,7 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
             Some(v) => v,
             None => continue,
         };
+        meter.entries += 1;
         // Follow symlinks so that a symlinked entry records the permissions
         // and modification time of its target.
         let meta = match tokio::fs::metadata(&zip_path).await {
@@ -2567,6 +2698,11 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         }
     }
     zip.finish().await?;
+    meter.finish(if zip_paths.interrupted() {
+        WalkResult::Cancelled
+    } else {
+        WalkResult::Complete
+    });
     Ok(())
 }
 
@@ -2661,11 +2797,196 @@ fn status_no_content(res: &mut Response) {
 
 /// Reports the failure of a resumable upload. The part file is kept, so the
 /// response names the upload to resume.
-fn respond_upload_failed(res: &mut Response, id: &str, err: &io::Error) {
-    warn!("Upload {id} failed: {err}");
+fn respond_upload_failed(res: &mut Response, id: &str, err: &io::Error, stats: &RequestStats) {
+    *stats.io_error.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((format!("{:?}", err.kind()), err.to_string()));
     *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     if let Ok(value) = HeaderValue::from_str(id) {
         res.headers_mut().insert(UPLOAD_ID_HEADER, value);
+    }
+}
+
+/// The first io error in the chain of `err`, which decides the response.
+fn io_error_of(err: &anyhow::Error) -> Option<&io::Error> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+}
+
+/// Length of the response body, if it is known before the body is sent.
+fn body_len(res: &Response) -> Option<u64> {
+    let body = res.body();
+    if body.is_end_stream() {
+        return Some(0);
+    }
+    body.size_hint()
+        .exact()
+        .or_else(|| res.headers().typed_get::<ContentLength>().map(|v| v.0))
+}
+
+/// Accounts for one upload request in the metrics and the event log. An
+/// upload that is dropped mid-transfer, as when the client disconnects, is
+/// counted as aborted.
+struct UploadMeter {
+    stats: Arc<RequestStats>,
+    upload_id: Option<String>,
+    /// Continues an earlier, interrupted upload.
+    resumed: bool,
+    done: bool,
+    _active: Gauge<'static>,
+}
+
+impl UploadMeter {
+    fn start(stats: Arc<RequestStats>, upload_id: Option<&str>, resumed: bool) -> Self {
+        Self {
+            stats,
+            upload_id: upload_id.map(str::to_string),
+            resumed,
+            done: false,
+            _active: METRICS.track_upload(),
+        }
+    }
+
+    /// Counts the upload by how its handler ended. A handler that answered
+    /// with a client error refused the upload; one that stored it or failed to
+    /// is told by its status and error.
+    fn finish(mut self, ret: &Result<()>, res: &Response) {
+        self.done = true;
+        let status = res.status();
+        match ret {
+            Err(err) => {
+                let io_error = io_error_of(err).map(|e| (format!("{:?}", e.kind()), e.to_string()));
+                let result = self.failure();
+                self.record(result, io_error);
+            }
+            Ok(()) if status.is_success() => {
+                let result = if self.resumed {
+                    UploadResult::Resumed
+                } else {
+                    UploadResult::Ok
+                };
+                self.record(result, None);
+            }
+            Ok(()) if status.is_server_error() => {
+                let io_error = self
+                    .stats
+                    .io_error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let result = self.failure();
+                self.record(result, io_error);
+            }
+            Ok(()) => self.record(UploadResult::Refused, None),
+        }
+    }
+
+    /// Reading the body failed on the way in: the client left. Anything else
+    /// went wrong on the server's side.
+    fn failure(&self) -> UploadResult {
+        if self.stats.body_failed.load(atomic::Ordering::Relaxed) {
+            UploadResult::Aborted
+        } else {
+            UploadResult::Failed
+        }
+    }
+
+    fn record(&self, result: UploadResult, io_error: Option<(String, String)>) {
+        METRICS.count_upload(result);
+        self.stats
+            .upload_counted
+            .store(true, atomic::Ordering::Relaxed);
+        if !matches!(result, UploadResult::Failed | UploadResult::Aborted) {
+            return;
+        }
+        let aborted = result == UploadResult::Aborted;
+        let id = self.upload_id.as_deref().unwrap_or("-");
+        let msg = match (&io_error, aborted) {
+            (_, true) => format!("Upload {id} aborted by the client"),
+            (Some((kind, message)), false) => format!("Upload {id} failed: {kind}, {message}"),
+            (None, false) => format!("Upload {id} failed"),
+        };
+        let mut fields: Vec<(&str, Value)> = vec![(
+            "reason",
+            if aborted { "aborted" } else { "io_error" }.into(),
+        )];
+        if let Some(id) = &self.upload_id {
+            fields.push(("upload_id", id.as_str().into()));
+        }
+        if let Some((kind, message)) = io_error {
+            fields.push(("io_kind", kind.into()));
+            fields.push(("error", message.into()));
+        }
+        fields.push((
+            "bytes_received",
+            self.stats
+                .bytes_received
+                .load(atomic::Ordering::Relaxed)
+                .into(),
+        ));
+        logger::event(log::Level::Warn, "upload_failed", &msg, fields);
+    }
+}
+
+impl Drop for UploadMeter {
+    fn drop(&mut self) {
+        if !self.done {
+            self.record(UploadResult::Aborted, None);
+        }
+    }
+}
+
+/// Accounts for one directory walk (search or zip) in the metrics and, when it
+/// did not run to its end, the event log. A walk that is dropped unfinished
+/// counts as cancelled.
+struct WalkMeter {
+    kind: WalkKind,
+    started: Instant,
+    entries: u64,
+    result: Option<WalkResult>,
+}
+
+impl WalkMeter {
+    fn new(kind: WalkKind) -> Self {
+        Self {
+            kind,
+            started: Instant::now(),
+            entries: 0,
+            result: None,
+        }
+    }
+
+    fn finish(mut self, result: WalkResult) {
+        self.result = Some(result);
+    }
+}
+
+impl Drop for WalkMeter {
+    fn drop(&mut self) {
+        let result = self.result.unwrap_or(WalkResult::Cancelled);
+        METRICS.count_walk(self.kind, result);
+        if result == WalkResult::Complete {
+            return;
+        }
+        let (kind, how) = (self.kind.as_str(), result.as_str());
+        let level = if result == WalkResult::Truncated {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        logger::event(
+            level,
+            "walk",
+            &format!("The {kind} walk was {how} after {} entries", self.entries),
+            vec![
+                ("kind", kind.into()),
+                ("result", how.into()),
+                ("entries", self.entries.into()),
+                (
+                    "duration_ms",
+                    (self.started.elapsed().as_millis() as u64).into(),
+                ),
+            ],
+        );
     }
 }
 
@@ -2837,7 +3158,22 @@ struct WalkLimiter {
     queued: AtomicUsize,
 }
 
-struct QueueGuard<'a>(&'a AtomicUsize);
+/// A walk slot, counted as active for as long as it is held.
+struct WalkPermit {
+    _permit: OwnedSemaphorePermit,
+    _active: Gauge<'static>,
+}
+
+impl WalkPermit {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: permit,
+            _active: METRICS.track_walk(),
+        }
+    }
+}
+
+struct QueueGuard<'a>(&'a AtomicUsize, #[allow(dead_code)] Gauge<'static>);
 
 impl Drop for QueueGuard<'_> {
     fn drop(&mut self) {
@@ -2858,16 +3194,17 @@ impl WalkLimiter {
 
     /// Wait for a free walk slot. Returns `None` when too many requests are
     /// already waiting.
-    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+    async fn acquire(&self) -> Option<WalkPermit> {
         if let Ok(permit) = self.slots.clone().try_acquire_owned() {
-            return Some(permit);
+            return Some(WalkPermit::new(permit));
         }
         if self.queued.fetch_add(1, atomic::Ordering::SeqCst) >= MAX_QUEUED_WALKS {
             self.queued.fetch_sub(1, atomic::Ordering::SeqCst);
             return None;
         }
-        let _queued = QueueGuard(&self.queued);
-        self.slots.clone().acquire_owned().await.ok()
+        let _queued = QueueGuard(&self.queued, METRICS.track_walk_waiting());
+        let permit = self.slots.clone().acquire_owned().await.ok()?;
+        Some(WalkPermit::new(permit))
     }
 }
 
@@ -2877,26 +3214,46 @@ fn respond_busy(res: &mut Response) {
         .insert(RETRY_AFTER, HeaderValue::from_static("5"));
 }
 
+/// The paths of a directory walk running on a blocking thread.
+struct Walk {
+    rx: mpsc::Receiver<PathBuf>,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl Walk {
+    async fn recv(&mut self) -> Option<PathBuf> {
+        self.rx.recv().await
+    }
+
+    /// Whether the walk stopped before its end because the server is
+    /// shutting down. Only meaningful once `recv` has returned `None`.
+    fn interrupted(&self) -> bool {
+        self.interrupted.load(atomic::Ordering::SeqCst)
+    }
+}
+
 /// Walk the directories on a blocking thread and stream the accepted paths to
 /// the returned receiver. The walk stops once the receiver is dropped; the
 /// permit is held until then.
-fn start_walk<F>(
-    permit: OwnedSemaphorePermit,
-    spec: WalkSpec,
-    include_entry: F,
-) -> mpsc::Receiver<PathBuf>
+fn start_walk<F>(permit: WalkPermit, spec: WalkSpec, include_entry: F) -> Walk
 where
     F: Fn(&DirEntry) -> bool + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(WALK_CHANNEL_SIZE);
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = interrupted.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        walk_dir_entries(&spec, &tx, include_entry);
+        if walk_dir_entries(&spec, &tx, include_entry) {
+            // Set before `tx` is dropped, which is what ends the receiver.
+            flag.store(true, atomic::Ordering::SeqCst);
+        }
     });
-    rx
+    Walk { rx, interrupted }
 }
 
-fn walk_dir_entries<F>(spec: &WalkSpec, tx: &mpsc::Sender<PathBuf>, include_entry: F)
+/// Returns whether the walk was cut short by the server shutting down.
+fn walk_dir_entries<F>(spec: &WalkSpec, tx: &mpsc::Sender<PathBuf>, include_entry: F) -> bool
 where
     F: Fn(&DirEntry) -> bool,
 {
@@ -2906,8 +3263,11 @@ where
         while let Some(entry) = it.next() {
             // Checked on every entry, not only on a send, so that a walk
             // without matches also stops once the client is gone.
-            if tx.is_closed() || !spec.running.load(atomic::Ordering::SeqCst) {
-                return;
+            if tx.is_closed() {
+                return false;
+            }
+            if !spec.running.load(atomic::Ordering::SeqCst) {
+                return true;
             }
             let entry = match entry {
                 Ok(v) => v,
@@ -2941,10 +3301,11 @@ where
                 continue;
             }
             if tx.blocking_send(entry_path.to_path_buf()).is_err() {
-                return;
+                return false;
             }
         }
     }
+    false
 }
 
 #[cfg(test)]

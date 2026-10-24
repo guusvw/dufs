@@ -1,14 +1,15 @@
 use std::{
     collections::HashMap,
     str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{Local, SecondsFormat};
 
 use hyper::header::HeaderValue;
+use serde_json::Value;
 
-use crate::{auth::get_auth_user, server::Request, utils::decode_uri};
+use crate::{auth::get_auth_user, logger, server::Request, utils::decode_uri};
 
 pub const DEFAULT_LOG_FORMAT: &str =
     r#"$time_iso8601 $log_level - $remote_addr "$request" $status"#;
@@ -16,14 +17,35 @@ pub const DEFAULT_LOG_FORMAT: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub struct HttpLogger {
     elements: Vec<LogElement>,
+    /// Whether the format was given by the user instead of being the default.
+    custom: bool,
+    /// One JSON object per line instead of the format.
+    json: bool,
 }
 
 impl Default for HttpLogger {
     fn default() -> Self {
-        DEFAULT_LOG_FORMAT
+        let mut logger: Self = DEFAULT_LOG_FORMAT
             .parse()
-            .expect("default log format is always valid")
+            .expect("default log format is always valid");
+        logger.custom = false;
+        logger
     }
+}
+
+/// What is known about a request once its response is ready.
+#[derive(Debug, Default)]
+pub struct Access {
+    pub remote_addr: Option<String>,
+    pub status: u16,
+    pub duration: Duration,
+    /// Length of the response body, `None` if it is streamed without one.
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: u64,
+    pub error_code: Option<String>,
+    pub upload_id: Option<String>,
+    /// Kind of the io error that failed the request, if one did.
+    pub io_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +56,33 @@ enum LogElement {
 }
 
 impl HttpLogger {
+    /// The logger of `--log-json`: it needs the request method, uri and user.
+    pub fn json() -> Self {
+        let elements = ["request_method", "request_uri", "remote_user"]
+            .map(|name| LogElement::Variable(name.to_string()))
+            .to_vec();
+        Self {
+            elements,
+            custom: false,
+            json: true,
+        }
+    }
+
+    /// Whether `--log-format` (or the config file) set the format.
+    pub fn is_custom(&self) -> bool {
+        self.custom
+    }
+
+    /// Make a value safe to put between the quotes of a log format. JSON
+    /// escapes it on its own.
+    fn escape(&self, value: &str) -> String {
+        if self.json {
+            value.to_string()
+        } else {
+            sanitize_log_value(value)
+        }
+    }
+
     pub fn data(&self, req: &Request) -> HashMap<String, String> {
         let mut data = HashMap::default();
         for element in self.elements.iter() {
@@ -42,7 +91,7 @@ impl HttpLogger {
                     "request" | "request_method" | "request_uri" => {
                         let uri = redact_query(&req.uri().to_string());
                         let decoded_uri = decode_uri(&uri)
-                            .map(|s| sanitize_log_value(&s))
+                            .map(|s| self.escape(&s))
                             .unwrap_or_else(|| uri.clone());
                         data.entry("request".to_string())
                             .or_insert_with(|| format!("{} {decoded_uri}", req.method()));
@@ -65,7 +114,7 @@ impl HttpLogger {
                         let logged = if is_credential_header(name) {
                             redact_credential(name, value)
                         } else {
-                            value.to_str().ok().map(sanitize_log_value)
+                            value.to_str().ok().map(|v| self.escape(v))
                         };
                         if let Some(logged) = logged {
                             data.insert(name.to_string(), logged);
@@ -78,9 +127,12 @@ impl HttpLogger {
         data
     }
 
-    pub fn log(&self, data: &HashMap<String, String>, err: Option<String>) {
+    pub fn log(&self, data: &HashMap<String, String>, access: &Access, err: Option<String>) {
         if self.elements.is_empty() {
             return;
+        }
+        if self.json {
+            return self.log_json(data, access, err);
         }
         let is_error = err.is_some();
         let now = Local::now();
@@ -91,6 +143,10 @@ impl HttpLogger {
             .map(|d| format!("{:.3}", d.as_secs_f64()))
             .unwrap_or_default();
         let log_level = if is_error { "ERROR" } else { "INFO" };
+        let status = access.status.to_string();
+        let request_time = format!("{:.3}", access.duration.as_secs_f64());
+        let bytes_sent = access.bytes_sent.map(|v| v.to_string());
+        let bytes_received = access.bytes_received.to_string();
 
         let mut output = String::new();
         for element in self.elements.iter() {
@@ -102,6 +158,13 @@ impl HttpLogger {
                         "time_iso8601" => Some(time_iso8601.as_str()),
                         "msec" => Some(msec.as_str()),
                         "log_level" => Some(log_level),
+                        "remote_addr" => access.remote_addr.as_deref(),
+                        "status" => Some(status.as_str()),
+                        "request_time" => Some(request_time.as_str()),
+                        "bytes_sent" => bytes_sent.as_deref(),
+                        "bytes_received" => Some(bytes_received.as_str()),
+                        "error_code" => access.error_code.as_deref(),
+                        "upload_id" => access.upload_id.as_deref(),
                         _ => None,
                     };
                     let val = resolved
@@ -115,27 +178,47 @@ impl HttpLogger {
             }
         }
         match err {
-            Some(err) => emit_http_access(&format!("{output} {err}"), true),
-            None => emit_http_access(&output, false),
+            Some(err) => logger::access(log::Level::Error, &format!("{output} {err}")),
+            None => logger::access(log::Level::Info, &output),
         }
     }
-}
 
-/// Emit via the `log` crate with target `http_access` so the system logger
-/// prints the line verbatim (no extra timestamp/level prefix).
-fn emit_http_access(msg: &str, is_error: bool) {
-    let level = if is_error {
-        log::Level::Error
-    } else {
-        log::Level::Info
-    };
-    log::logger().log(
-        &log::Record::builder()
-            .args(format_args!("{}", msg))
-            .level(level)
-            .target("http_access")
-            .build(),
-    );
+    fn log_json(&self, data: &HashMap<String, String>, access: &Access, err: Option<String>) {
+        let text = |key: &str| data.get(key).cloned().unwrap_or_default();
+        let optional = |value: &Option<String>| value.clone().map_or(Value::Null, Value::from);
+        let (method, uri) = (text("request_method"), text("request_uri"));
+        let msg = format!("{method} {uri} {}", access.status);
+        let mut fields = vec![
+            ("remote", optional(&access.remote_addr)),
+            ("user", optional(&data.get("remote_user").cloned())),
+            ("method", Value::from(method)),
+            ("uri", Value::from(uri)),
+            ("status", Value::from(access.status)),
+            (
+                "duration_ms",
+                Value::from((access.duration.as_secs_f64() * 1e6).round() / 1e3),
+            ),
+            (
+                "bytes_sent",
+                access.bytes_sent.map_or(Value::Null, Value::from),
+            ),
+            ("bytes_received", Value::from(access.bytes_received)),
+            ("error_code", optional(&access.error_code)),
+            ("upload_id", optional(&access.upload_id)),
+        ];
+        if let Some(kind) = &access.io_kind {
+            fields.push(("io_kind", Value::from(kind.as_str())));
+        }
+        let level = if err.is_some() {
+            log::Level::Error
+        } else {
+            log::Level::Info
+        };
+        if let Some(err) = err {
+            fields.push(("error", Value::from(err)));
+        }
+        logger::access(level, &logger::json_line(level, &msg, "", fields));
+    }
 }
 
 impl FromStr for HttpLogger {
@@ -166,7 +249,11 @@ impl FromStr for HttpLogger {
         if !cache.is_empty() {
             elements.push(LogElement::Literal(cache.to_string()));
         }
-        Ok(Self { elements })
+        Ok(Self {
+            elements,
+            custom: true,
+            json: false,
+        })
     }
 }
 

@@ -1,9 +1,11 @@
 mod args;
 mod auth;
 mod error;
+mod healthcheck;
 mod http_logger;
 mod http_utils;
 mod logger;
+mod metrics;
 mod noscript;
 mod server;
 mod utils;
@@ -12,6 +14,7 @@ mod utils;
 extern crate log;
 
 use crate::args::{build_cli, print_completions, Args};
+use crate::metrics::METRICS;
 use crate::server::Server;
 #[cfg(feature = "tls")]
 use crate::utils::{load_certs, load_private_key};
@@ -21,7 +24,8 @@ use args::BindAddr;
 use clap_complete::Shell;
 use futures_util::future::join_all;
 
-use hyper::{body::Incoming, service::service_fn, Request};
+use http_body_util::Full;
+use hyper::{body::Incoming, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::{
@@ -52,9 +56,14 @@ use tokio_util::sync::CancellationToken;
 /// Delay after the first failed `accept()`, doubled on each further failure.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Longest a connection to the metrics listener may stay open.
+const METRICS_CONN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(url) = healthcheck::requested(std::env::args()) {
+        std::process::exit(healthcheck::run(url).await);
+    }
     let cmd = build_cli();
     let matches = cmd.get_matches();
     if let Some(generator) = matches.get_one::<Shell>("completions") {
@@ -63,15 +72,28 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let mut args = Args::parse(matches)?;
-    logger::init(args.log_file.clone()).map_err(|e| anyhow!("Failed to init logger, {e}"))?;
+    logger::init(args.log_file.clone(), args.log_json)
+        .map_err(|e| anyhow!("Failed to init logger, {e}"))?;
     let (new_addrs, print_addrs) = check_addrs(&args)?;
     args.addrs = new_addrs;
     let running = Arc::new(AtomicBool::new(true));
-    let listening = print_listening(&args, &print_addrs)?;
+    let (listening, urls) = print_listening(&args, &print_addrs)?;
     let shutdown_timeout = Duration::from_secs(args.shutdown_timeout);
     let shutdown = Shutdown::default();
     let handles = serve(args, running.clone(), shutdown.clone())?;
-    println!("{listening}");
+    if logger::is_json() {
+        println!(
+            "{}",
+            logger::json_line(
+                log::Level::Info,
+                &format!("Listening on {}", urls.join(", ")),
+                "listening",
+                vec![("addrs", urls.into())],
+            )
+        );
+    } else {
+        println!("{listening}");
+    }
 
     let mut serving = pin!(join_all(handles));
     tokio::select! {
@@ -85,13 +107,27 @@ async fn main() -> Result<()> {
         _ = shutdown_signal() => {
             // The health check starts answering 503 and walks stop early.
             running.store(false, Ordering::SeqCst);
+            METRICS.set_draining();
             shutdown.drain.cancel();
-            info!(
-                "Shutting down, waiting up to {}s for in-flight requests",
-                shutdown_timeout.as_secs()
+            logger::event(
+                log::Level::Info,
+                "shutdown",
+                &format!(
+                    "Shutting down, waiting up to {}s for in-flight requests",
+                    shutdown_timeout.as_secs()
+                ),
+                vec![
+                    ("phase", "draining".into()),
+                    ("timeout_s", shutdown_timeout.as_secs().into()),
+                ],
             );
             if timeout(shutdown_timeout, &mut serving).await.is_err() {
-                warn!("Shutdown timeout reached, aborting remaining requests");
+                logger::event(
+                    log::Level::Warn,
+                    "shutdown",
+                    "Shutdown timeout reached, aborting remaining requests",
+                    vec![("phase", "timeout".into())],
+                );
                 shutdown.abort.cancel();
                 serving.await;
             }
@@ -107,6 +143,19 @@ struct Shutdown {
     drain: CancellationToken,
     /// Drop the connections that are still open.
     abort: CancellationToken,
+}
+
+/// Log a failure of a listener or of the signal handling.
+fn listener_error(what: &str, err: &io::Error) {
+    logger::event(
+        log::Level::Error,
+        "listener_error",
+        &format!("{what}, {err}"),
+        vec![
+            ("io_kind", format!("{:?}", err.kind()).into()),
+            ("error", err.to_string().into()),
+        ],
+    );
 }
 
 /// Back-off between failed `accept()` calls, e.g. while out of file descriptors.
@@ -133,7 +182,7 @@ impl AcceptBackoff {
     /// drain was requested meanwhile.
     async fn wait(&mut self, err: &io::Error, drain: &CancellationToken) -> bool {
         if self.delay.is_none() {
-            error!("Failed to accept connection, {err}");
+            listener_error("Failed to accept connection", err);
         }
         let delay = self.next_delay();
         tokio::select! {
@@ -273,7 +322,15 @@ fn serve(args: Args, running: Arc<AtomicBool>, shutdown: Shutdown) -> Result<Vec
     let port = args.port;
     let tls_config = (args.tls_cert.clone(), args.tls_key.clone());
     let path_is_file = args.path_is_file;
+    let metrics_bind = args.metrics_bind;
     let server_handle = Arc::new(Server::init(args, running)?);
+    if let Some(addr) = metrics_bind {
+        let listener =
+            create_listener(addr).with_context(|| format!("Failed to bind metrics on `{addr}`"))?;
+        // Not one of the handles: it keeps answering while the server drains,
+        // so that `dufs_draining` can be seen, and ends with the process.
+        tokio::spawn(metrics_loop(listener));
+    }
     if !path_is_file {
         server_handle.spawn_part_sweep();
     }
@@ -336,6 +393,44 @@ fn serve(args: Args, running: Arc<AtomicBool>, shutdown: Shutdown) -> Result<Vec
         }
     }
     Ok(handles)
+}
+
+/// Serve `GET /metrics` on its own listener, apart from the file server.
+async fn metrics_loop(listener: TcpListener) {
+    let never = CancellationToken::new();
+    let mut backoff = AcceptBackoff::default();
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                backoff.reset();
+                tokio::spawn(async move {
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service_fn(metrics_response));
+                    // A scrape is short; do not keep a stalled client forever.
+                    let _ = timeout(METRICS_CONN_TIMEOUT, conn).await;
+                });
+            }
+            Err(err) => {
+                backoff.wait(&err, &never).await;
+            }
+        }
+    }
+}
+
+async fn metrics_response(
+    req: Request<Incoming>,
+) -> Result<Response<Full<bytes::Bytes>>, std::convert::Infallible> {
+    let mut res = Response::new(Full::default());
+    if req.method() == Method::GET && req.uri().path() == "/metrics" {
+        *res.body_mut() = Full::new(METRICS.render().into());
+        res.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static(metrics::CONTENT_TYPE),
+        );
+    } else {
+        *res.status_mut() = StatusCode::NOT_FOUND;
+    }
+    Ok(res)
 }
 
 async fn handle_stream<T>(
@@ -435,7 +530,7 @@ fn interface_addrs() -> Result<(Vec<BindAddr>, Vec<BindAddr>)> {
     Ok((ipv4_addrs, ipv6_addrs))
 }
 
-fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
+fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<(String, Vec<String>)> {
     let mut output = String::new();
     let urls = print_addrs
         .iter()
@@ -468,7 +563,7 @@ fn print_listening(args: &Args, print_addrs: &[BindAddr]) -> Result<String> {
         output.push_str(&format!("Listening on:\n{info}\n"))
     }
 
-    Ok(output)
+    Ok((output, urls))
 }
 
 /// Resolves when the process is asked to stop: SIGINT or SIGTERM on Unix,
@@ -483,7 +578,7 @@ async fn shutdown_signal() {
         ) {
             (Ok(sigint), Ok(sigterm)) => (sigint, sigterm),
             (Err(e), _) | (_, Err(e)) => {
-                error!("Failed to install signal handlers, {e}");
+                listener_error("Failed to install signal handlers", &e);
                 return;
             }
         };
@@ -494,7 +589,7 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     if let Err(e) = tokio::signal::ctrl_c().await {
-        error!("Failed to install CTRL+C signal handler, {e}");
+        listener_error("Failed to install CTRL+C signal handler", &e);
     }
 }
 

@@ -4,21 +4,52 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use std::{
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
 };
 use tokio::io::AsyncRead;
 use tokio_util::io::poll_read_buf;
 
+use crate::metrics::METRICS;
 use crate::server::BUF_SIZE;
 
+/// What one request has shown so far that its access line and the upload
+/// metrics need. It travels in the request's extensions.
+#[derive(Debug, Default)]
+pub struct RequestStats {
+    /// Request body bytes read by an upload.
+    pub bytes_received: AtomicU64,
+    /// Reading the request body failed, i.e. the client went away or broke
+    /// the framing, as opposed to the server failing to store it.
+    pub body_failed: AtomicBool,
+    /// The request was counted as an upload by `dufs_uploads_total`.
+    pub upload_counted: AtomicBool,
+    /// Kind and message of the io error that failed an upload.
+    pub io_error: Mutex<Option<(String, String)>>,
+}
+
+impl RequestStats {
+    pub fn of(req: &crate::server::Request) -> Arc<Self> {
+        req.extensions()
+            .get::<Arc<Self>>()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// An upload request's body as a stream of chunks.
 #[derive(Debug)]
 pub struct IncomingStream {
     inner: Incoming,
+    stats: Arc<RequestStats>,
 }
 
 impl IncomingStream {
-    pub fn new(inner: Incoming) -> Self {
-        Self { inner }
+    pub fn new(inner: Incoming, stats: Arc<RequestStats>) -> Self {
+        Self { inner, stats }
     }
 }
 
@@ -28,11 +59,19 @@ impl Stream for IncomingStream {
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match futures_util::ready!(Pin::new(&mut self.inner).poll_frame(cx)?) {
-                Some(frame) => match frame.into_data() {
-                    Ok(data) => return Poll::Ready(Some(Ok(data))),
-                    Err(_frame) => {}
-                },
+            match futures_util::ready!(Pin::new(&mut self.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        let len = data.len() as u64;
+                        self.stats.bytes_received.fetch_add(len, Ordering::Relaxed);
+                        METRICS.add_upload_bytes(len);
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                }
+                Some(Err(err)) => {
+                    self.stats.body_failed.store(true, Ordering::Relaxed);
+                    return Poll::Ready(Some(Err(err.into())));
+                }
                 None => return Poll::Ready(None),
             }
         }

@@ -1,4 +1,9 @@
-use crate::{args::Args, server::Response, utils::unix_now};
+use crate::{
+    args::Args,
+    metrics::{AuthScheme, METRICS},
+    server::Response,
+    utils::unix_now,
+};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -243,10 +248,17 @@ impl AccessControl {
                         false,
                     );
                 }
+                METRICS.count_auth_failure(AuthScheme::Token);
             }
         }
 
         if let Some(authorization) = authorization {
+            let scheme = credential_scheme(authorization);
+            let count_failure = || {
+                if let Some(scheme) = scheme {
+                    METRICS.count_auth_failure(scheme);
+                }
+            };
             if let Some(user) = get_auth_user(authorization) {
                 let Some((pass, ap)) = self.users.get(&user) else {
                     // Do the work of a real check so the response time does
@@ -262,6 +274,7 @@ impl AccessControl {
                         self.dummy_pass(),
                         false,
                     );
+                    count_failure();
                     return (None, None, false, false);
                 };
                 match check_auth(
@@ -293,6 +306,7 @@ impl AccessControl {
                 }
             }
 
+            count_failure();
             return (None, None, false, false);
         }
 
@@ -737,6 +751,19 @@ pub fn www_authenticate(res: &mut Response, args: &Args, stale: bool) -> Result<
         res.headers_mut().append(WWW_AUTHENTICATE, basic);
     }
     Ok(())
+}
+
+/// The scheme of the credentials in an `Authorization` header, if it is one
+/// that dufs can verify.
+fn credential_scheme(authorization: &HeaderValue) -> Option<AuthScheme> {
+    let scheme = authorization.to_str().ok()?.split_whitespace().next()?;
+    if scheme.eq_ignore_ascii_case("basic") {
+        Some(AuthScheme::Basic)
+    } else if scheme.eq_ignore_ascii_case("digest") {
+        Some(AuthScheme::Digest)
+    } else {
+        None
+    }
 }
 
 pub fn get_auth_user(authorization: &HeaderValue) -> Option<String> {

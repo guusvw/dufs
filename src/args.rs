@@ -6,7 +6,7 @@ use clap_complete::{generate, Generator, Shell};
 use serde::{Deserialize, Deserializer};
 use smart_default::SmartDefault;
 use std::env;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -216,6 +216,32 @@ pub fn build_cli() -> Command {
                 .help("Customize http log format"),
         )
         .arg(
+            Arg::new("log-json")
+                .env("DUFS_LOG_JSON")
+                .hide_env(true)
+                .long("log-json")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("log-format")
+                .help("Log one JSON object per line instead of text"),
+        )
+        .arg(
+            Arg::new("log-skip-health")
+                .env("DUFS_LOG_SKIP_HEALTH")
+                .hide_env(true)
+                .long("log-skip-health")
+                .action(ArgAction::SetTrue)
+                .help("Do not log health checks that succeed"),
+        )
+        .arg(
+            Arg::new("metrics-bind")
+                .env("DUFS_METRICS_BIND")
+                .hide_env(true)
+                .long("metrics-bind")
+                .value_name("addr:port")
+                .value_parser(value_parser!(SocketAddr))
+                .help("Serve Prometheus metrics on this extra address, e.g. 127.0.0.1:9101"),
+        )
+        .arg(
             Arg::new("log-file")
                 .env("DUFS_LOG_FILE")
                 .hide_env(true)
@@ -259,6 +285,13 @@ pub fn build_cli() -> Command {
                 .value_name("duration")
                 .value_parser(parse_duration)
                 .help("Remove unfinished upload files after this long, e.g. 90m, 24h, 7d [default: 24h]"),
+        )
+        .arg(
+            Arg::new("healthcheck")
+                .long("healthcheck")
+                .value_name("URL")
+                .num_args(0..=1)
+                .help("Probe a running server and exit 0 if it answers 200 [default: http://127.0.0.1:$DUFS_PORT/__dufs__/health]"),
         )
         .arg(
             Arg::new("completions")
@@ -339,7 +372,10 @@ pub struct Args {
     #[serde(deserialize_with = "deserialize_log_http")]
     #[serde(rename = "log-format")]
     pub http_logger: HttpLogger,
+    pub log_json: bool,
+    pub log_skip_health: bool,
     pub log_file: Option<PathBuf>,
+    pub metrics_bind: Option<SocketAddr>,
     pub compress: Compress,
     #[serde(default = "default_shutdown_timeout")]
     #[default(default_shutdown_timeout())]
@@ -470,6 +506,24 @@ impl Args {
 
         if let Some(log_format) = matches.get_one::<String>("log-format") {
             args.http_logger = log_format.parse()?;
+        }
+
+        if !args.log_json {
+            args.log_json = matches.get_flag("log-json");
+        }
+        if args.log_json {
+            if args.http_logger.is_custom() {
+                bail!("log-format and log-json cannot be used together");
+            }
+            args.http_logger = HttpLogger::json();
+        }
+
+        if !args.log_skip_health {
+            args.log_skip_health = matches.get_flag("log-skip-health");
+        }
+
+        if let Some(addr) = matches.get_one::<SocketAddr>("metrics-bind") {
+            args.metrics_bind = Some(*addr);
         }
 
         if let Some(log_file) = matches.get_one::<PathBuf>("log-file") {

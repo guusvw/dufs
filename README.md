@@ -81,6 +81,10 @@ Options:
                              Seconds to wait for in-flight requests on SIGINT/SIGTERM before aborting them [default: 10]
       --token-secret-file <path>  Path to the secret that signs share tokens, created if missing
       --upload-part-ttl <duration>  Remove unfinished upload files after this long, e.g. 90m, 24h, 7d [default: 24h]
+      --log-json             Log one JSON object per line instead of text
+      --log-skip-health      Do not log health checks that succeed
+      --metrics-bind <addr:port>  Serve Prometheus metrics on this extra address, e.g. 127.0.0.1:9101
+      --healthcheck [URL]    Probe a running server and exit 0 if it answers 200 [default: http://127.0.0.1:$DUFS_PORT/__dufs__/health]
       --completions <shell>  Print shell completion script for <shell> [possible values: bash, elvish, fish, powershell, zsh]
       --tls-cert <path>      Path to an SSL/TLS certificate to serve with HTTPS
       --tls-key <path>       Path to the SSL/TLS certificate's private key
@@ -373,6 +377,92 @@ dufs --log-format '$remote_addr $remote_user "$request" $status' -a /@admin:admi
 2022-08-06T07:04:37+08:00 INFO - 127.0.0.1 admin "GET /" 200
 ```
 
+Besides the variables above, an access line can use:
+
+| variable        | description                                                                  |
+| --------------- | ---------------------------------------------------------------------------- |
+| $request_time   | seconds from receiving the request to having the response ready, 3 decimals |
+| $bytes_sent     | length of the response body, `-` if it is streamed without a known length    |
+| $bytes_received | bytes of the request body that dufs read (uploads), `0` otherwise            |
+| $error_code     | the `x-dufs-error-code` sent with the response, or `-`                       |
+| $upload_id      | the id of a resumable upload (`?upload=`), or `-`                            |
+
+#### JSON logs
+
+`--log-json` (`DUFS_LOG_JSON`, `log-json`) writes every line as one JSON object instead of text. It cannot be combined with `--log-format`.
+
+```
+{"ts":"2026-10-24T08:51:01.123Z","level":"INFO","msg":"PUT /inbox/a.bin 201","remote":"172.18.0.1","user":null,"method":"PUT","uri":"/inbox/a.bin","status":201,"duration_ms":12.482,"bytes_sent":0,"bytes_received":1048576,"error_code":null,"upload_id":null}
+```
+
+An access line has `ts` (UTC), `level`, `msg`, `remote`, `user` (the name the client authenticated as), `method`, `uri` (the `token` parameter is redacted), `status`, `duration_ms`, `bytes_sent`, `bytes_received`, `error_code` and `upload_id`; a value that does not apply is `null`. `bytes_sent` is the announced length of the response body, `null` for a body streamed without one (such as a zip). A request whose client left in the middle of an upload is logged and counted with status `499`, as nginx does. A request that failed with an I/O error adds `io_kind` (the Rust `ErrorKind`, such as `PermissionDenied`) and `error`; file contents and credentials are never logged.
+
+Everything else dufs logs becomes an object with `ts`, `level` and `msg` as well. Events also have an `event` field and their own fields:
+
+| `event`          | when                                         | fields                                                        |
+| ---------------- | -------------------------------------------- | ------------------------------------------------------------- |
+| `listening`      | at startup                                   | `addrs`                                                       |
+| `part_sweep`     | a sweep removed stale upload files           | `removed`, `remaining`, `remaining_bytes`, `duration_ms`      |
+| `walk`           | a search or zip was truncated or cancelled   | `kind` (`search`, `zip`), `result`, `entries`, `duration_ms`  |
+| `upload_failed`  | an upload failed or the client left          | `reason` (`io_error`, `aborted`), `upload_id`, `io_kind`, `error`, `bytes_received` |
+| `shutdown`       | SIGINT/SIGTERM was received, or the timeout hit | `phase` (`draining`, `timeout`), `timeout_s`               |
+| `listener_error` | accepting a connection or the signal handling failed | `io_kind`, `error`                                    |
+
+`--log-skip-health` (`DUFS_LOG_SKIP_HEALTH`, `log-skip-health`) leaves out the access lines of `/__dufs__/health` that answered `200`; failures, such as the `503` while draining, are still logged. Use it when a load balancer or an orchestrator probes the server every few seconds.
+
+### Metrics
+
+`--metrics-bind <addr:port>` (`DUFS_METRICS_BIND`, `metrics-bind`) starts a second listener that serves Prometheus metrics (text format 0.0.4) on `GET /metrics` and answers `404` to everything else. It is off by default and the metrics are never served on the main port.
+
+```sh
+dufs --metrics-bind 127.0.0.1:9101
+curl http://127.0.0.1:9101/metrics
+```
+
+**The metrics listener has no authentication, so do not publish it.** Bind it to a loopback or private address, or in a container to a port that is not mapped to the host and is not behind a reverse proxy or `tailscale serve`; let only the scraper reach it (for example `dufs:9101` on the compose network).
+
+Health checks are not counted in the request metrics. Labels are small fixed sets, never paths, users or ids, so there are at most about 70 series.
+
+| metric | type | labels | meaning |
+| ------ | ---- | ------ | ------- |
+| `dufs_build_info` | gauge, always 1 | `version`, `commit` | the build |
+| `dufs_http_requests_total` | counter | `method` (`GET`, `HEAD`, `PUT`, `PATCH`, `DELETE`, `MOVE`, `COPY`, `PROPFIND`, `other`), `class` (`2xx`, `3xx`, `4xx`, `5xx`) | requests, a series appears with its first request |
+| `dufs_http_request_duration_seconds` | histogram, buckets 0.005 0.025 0.1 0.5 2.5 10 60 | | time until the response (headers) is ready, not until a download has been sent |
+| `dufs_http_requests_in_flight` | gauge | | requests being handled |
+| `dufs_upload_bytes_total` | counter | | request body bytes read by uploads, also of those that did not finish |
+| `dufs_uploads_total` | counter | `result` | `ok` stored, `failed` the server failed to store it, `aborted` the client left, `resumed` a resumed upload completed, `refused` turned away with a 4xx before taking data (a `401` challenge is not counted) |
+| `dufs_uploads_active` | gauge | | uploads receiving data |
+| `dufs_part_files`, `dufs_part_bytes` | gauge | | upload temp files left on disk, as found by the last sweep |
+| `dufs_part_files_swept_total` | counter | | stale upload temp files removed |
+| `dufs_walks_total` | counter | `kind` (`search`, `zip`), `result` (`complete`, `truncated`, `cancelled`) | directory walks by how they ended |
+| `dufs_walks_active`, `dufs_walks_waiting` | gauge | | walks running, and requests waiting for one of the limited walk slots |
+| `dufs_auth_failures_total` | counter | `scheme` (`basic`, `digest`, `token`) | credentials that were presented and rejected |
+| `dufs_draining` | gauge 0/1 | | 1 once SIGINT/SIGTERM was received. The metrics listener keeps answering while the server drains |
+| `process_threads`, `process_open_fds`, `process_resident_memory_bytes`, `process_start_time_seconds` | gauge | | read from `/proc/self` when scraped; Linux only |
+
+`commit` is the git commit of the build; set the `DUFS_COMMIT` environment variable when building without a git checkout (for example `docker build --build-arg DUFS_COMMIT=$(git rev-parse --short=12 HEAD) .`).
+
+### Health check of a container
+
+The image is built `FROM scratch`, so it has no `curl` for a container health check. `dufs --healthcheck [URL]` probes a running server instead: it sends `GET` to `URL` (default `http://127.0.0.1:${DUFS_PORT:-5000}/__dufs__/health`) and exits `0` if the answer is `200` within 3 seconds, otherwise it exits `1` with one line on stderr giving the reason. It starts no server and reads no configuration, only `DUFS_PORT`. Only `http://` URLs are supported; when the server serves a `--path-prefix`, add it to the URL.
+
+```yaml
+services:
+  dufs:
+    image: sigoden/dufs
+    command: /data -A
+    environment:
+      DUFS_PORT: "5000"
+    healthcheck:
+      test: ["CMD", "/bin/dufs", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+While the server drains on SIGTERM the health check answers `503`, so the container turns unhealthy until it exits.
+
 ## Environment variables
 
 All options can be set using environment variables prefixed with `DUFS_`.
@@ -403,6 +493,9 @@ All options can be set using environment variables prefixed with `DUFS_`.
     --compress <compress>   DUFS_COMPRESS=low
     --shutdown-timeout <seconds>  DUFS_SHUTDOWN_TIMEOUT=10
     --upload-part-ttl <duration>  DUFS_UPLOAD_PART_TTL=24h
+    --log-json              DUFS_LOG_JSON=true
+    --log-skip-health       DUFS_LOG_SKIP_HEALTH=true
+    --metrics-bind <addr:port>  DUFS_METRICS_BIND=0.0.0.0:9101
     --tls-cert <path>       DUFS_TLS_CERT=cert.pem
     --tls-key <path>        DUFS_TLS_KEY=key.pem
     --token-secret-file <path>  DUFS_TOKEN_SECRET_FILE=token.secret
@@ -442,6 +535,9 @@ render-spa: true
 assets: ./assets/
 log-format: '$remote_addr "$request" $status $http_user_agent'
 log-file: ./dufs.log
+log-json: false
+log-skip-health: false
+metrics-bind: 0.0.0.0:9101
 compress: low
 shutdown-timeout: 10
 upload-part-ttl: 24h
